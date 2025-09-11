@@ -83,6 +83,14 @@ class ComWeChatChannel(SlaveChannel):
                                     name="EWS User Auth",
                                     uid=ChatID("__ews_user_auth__"))
 
+        # 配置API连接参数
+        self.api_host = self.config.get("api_host", "127.0.0.1")
+        self.api_port = self.config.get("api_port", 18888)
+        self.api_base_url = f"http://{self.api_host}:{self.api_port}"
+        
+        # 配置WeChatRobot实例使用自定义host和port
+        self.bot = WeChatRobot(ip="0.0.0.0", port=23456, api_host=self.api_host, api_port=self.api_port)
+        
         self.qrcode_timeout = self.config.get("qrcode_timeout", 10)
         self.login()
         self.me = self.bot.GetSelfInfo()["data"]
@@ -96,7 +104,7 @@ class ComWeChatChannel(SlaveChannel):
             import subprocess
             import json
             
-            url = 'http://127.0.0.1:18888/api/?type=35'
+            url = f'{self.api_base_url}/api/?type=35'
             payload = {'version': '3.9.12.55'}
             payload_str = json.dumps(payload)
             
@@ -137,7 +145,7 @@ class ComWeChatChannel(SlaveChannel):
                 payload_str = json.dumps(payload)
 
                 # 设置图片保存路径 (type=13)
-                url13 = 'http://127.0.0.1:18888/api/?type=13'
+                url13 = f'{self.api_base_url}/api/?type=13'
                 self.logger.info(f"向Hook发送图片保存路径: {win_path}")
                 cmd13 = ["curl", "-X", "POST", url13, "-d", payload_str]
                 result13 = subprocess.run(cmd13, capture_output=True, text=True, timeout=5)
@@ -154,7 +162,7 @@ class ComWeChatChannel(SlaveChannel):
                         self.logger.error(f"解析Hook返回的JSON失败. Response: {result13.stdout.strip()}")
 
                 # 设置语音保存路径 (type=11)
-                url11 = 'http://127.0.0.1:18888/api/?type=11'
+                url11 = f'{self.api_base_url}/api/?type=11'
                 self.logger.info(f"向Hook发送语音保存路径: {win_path}")
                 cmd11 = ["curl", "-X", "POST", url11, "-d", payload_str]
                 result11 = subprocess.run(cmd11, capture_output=True, text=True, timeout=5)
