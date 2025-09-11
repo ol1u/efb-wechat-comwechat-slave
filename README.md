@@ -43,7 +43,6 @@
 
    ```bash
    pip3 install -U git+https://github.com/ehForwarderBot/efb-telegram-master.git
-   pip3 install -U git+https://github.com/0honus0/python-comwechatrobot-http.git  
    pip3 install lottie cairosvg pyqrcode
    可能缺少相关依赖，请根据报错自行安装
    ```
@@ -54,6 +53,7 @@
 
    ```bash
    pip3 install -U git+https://github.com/sddpljx/efb-wechat-comwechat-slave.git
+   pip3 install -U git+https://github.com/sddpljx/python-comwechatrobot-http.git  
    ```
 
    ---
@@ -111,6 +111,7 @@
    ehforwarderbot -p ComWeChat
    ```
    启动后，日志会显示从端已经根据 dir 中填写的 WSL 路径，将 Hook 路径自动映射为Windows路径。此时测试相关功能是否正常。
+
 
 
 
