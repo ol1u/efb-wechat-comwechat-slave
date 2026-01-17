@@ -223,7 +223,7 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
     //appmsg/type = 19 : 合并转发的聊天记录
     //appmsg/type = 21 : 微信运动
     //appmsg/type = 24 : 从收藏中分享的笔记
-    //appmsg/type = 33 : 美团外卖
+    //appmsg/type = 33 : 美团外卖/腾讯微证券
     //appmsg/type = 35 : 消息同步
     //appmsg/type = 36 : 京东农场，滴滴打车
     //appmsg/type = 51 : 视频（微信视频号分享）
@@ -408,10 +408,11 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
             )
         elif type == 33:
             sourcedisplayname = xml.xpath('/msg/appmsg/sourcedisplayname/text()')[0]
+            title = xml.xpath('string(/msg/appmsg/title)')
             weappiconurl = xml.xpath('/msg/appmsg/weappinfo/weappiconurl/text()')[0]
             url = xml.xpath('/msg/appmsg/url/text()')[0]
             attribute = LinkAttribute(
-                title=sourcedisplayname,
+                title=f"{sourcedisplayname}\n{title}",
                 description=None,
                 url=url,
                 image=weappiconurl
@@ -573,10 +574,10 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
 
 def efb_location_wrapper(msg: str) -> Message:
     efb_msg = Message()
-    label = re.search('''label="(.*?)"''', msg).group(1)
+    text = re.search('''poiname="(.*?)"''', msg).group(1)
     x = re.search('''x="(.*?)"''', msg).group(1)
     y = re.search('''y="(.*?)"''', msg).group(1)
-    efb_msg.text = label
+    efb_msg.text = text
     efb_msg.attributes = LocationAttribute(latitude=float(x),
                                            longitude=float(y))
     efb_msg.type = MsgType.Location
