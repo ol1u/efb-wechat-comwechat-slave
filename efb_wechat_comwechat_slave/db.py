@@ -1,6 +1,8 @@
+import json
 import logging
 
 from peewee import (
+    BigIntegerField,
     CharField,
     Model,
     TextField,
@@ -41,6 +43,15 @@ class WxMsgLog(BaseModel):
         )
 
 
+class MediaRetry(BaseModel):
+    token = CharField(primary_key=True)
+    created_at = BigIntegerField(index=True)
+    payload = TextField()
+
+    class Meta:
+        table_name = "media_retry"
+
+
 class DatabaseManager:
     logger = logging.getLogger(__name__)
 
@@ -48,7 +59,8 @@ class DatabaseManager:
         base_path = utils.get_data_path(channel.channel_id)
 
         self.logger.debug("Loading database...")
-        database.init(str(base_path / "wxdata.db"))
+        database_path = base_path / "wxdata.db"
+        database.init(str(database_path))
         database.start()
         database.connect()
         self.logger.debug("Database loaded.")
@@ -65,7 +77,23 @@ class DatabaseManager:
         """
         Initializing tables.
         """
-        database.create_tables([GroupChatInfo], safe=True)
+        database.create_tables([GroupChatInfo, MediaRetry], safe=True)
+        cursor = database.execute_sql(
+            """
+            CREATE TRIGGER IF NOT EXISTS media_retry_keep_latest_200
+            AFTER INSERT ON media_retry
+            BEGIN
+                DELETE FROM media_retry
+                WHERE token IN (
+                    SELECT token
+                    FROM media_retry
+                    ORDER BY created_at DESC, token DESC
+                    LIMIT -1 OFFSET 200
+                );
+            END
+            """
+        )
+        cursor.fetchall()
 
     @staticmethod
     def get_all_group_aliases():
@@ -78,3 +106,31 @@ class DatabaseManager:
             wxid = wxid,
             group_alias = alias,
         ).execute()
+
+    @staticmethod
+    def save_media_retry(token, payload, *, created_at):
+        return MediaRetry.replace(
+            token=token,
+            created_at=created_at,
+            payload=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        ).execute()
+
+    @staticmethod
+    def get_media_retry(token):
+        retry = MediaRetry.get_or_none(MediaRetry.token == token)
+        if retry is None:
+            return None
+        try:
+            payload = json.loads(retry.payload)
+        except (TypeError, ValueError):
+            DatabaseManager.logger.warning(
+                "Ignoring invalid media retry payload: token=%s",
+                token,
+                exc_info=True,
+            )
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def delete_media_retry(token):
+        return MediaRetry.delete().where(MediaRetry.token == token).execute()

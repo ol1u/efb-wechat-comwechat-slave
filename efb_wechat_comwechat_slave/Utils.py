@@ -1,4 +1,5 @@
 import logging
+import re
 import tempfile
 from ehforwarderbot.types import MessageID
 import requests as requests
@@ -13,6 +14,7 @@ VOICE_OGG_EXPORT_KWARGS = {
     "codec": "libopus",
     "parameters": ['-vbr', 'on'],
 }
+MEDIA_WAIT_SECONDS = 5
 
 #从本地读取配置
 def load_config(path : str) -> Dict[str, None]:
@@ -29,18 +31,19 @@ def load_config(path : str) -> Dict[str, None]:
         config: Dict[str, Any] = d
     return config
 
-def download_file(url: str, retry: int = 3) -> tempfile:
+def download_file(url: str, retry: int = 3, timeout: int = 10) -> tempfile:
     """
     A function that downloads files from given URL
     Remember to close the file once you are done with the file!
     :param retry: The max retries before giving up
+    :param timeout: The HTTP request timeout in seconds
     :param url: The URL that points to the file
     """
     count = 1
     while True:
         try:
             file = tempfile.NamedTemporaryFile()
-            r = requests.get(url, stream=True, timeout=10)
+            r = requests.get(url, stream=True, timeout=timeout)
             for chunk in r.iter_content(chunk_size=1024):
                 if chunk:
                     file.write(chunk)
@@ -115,6 +118,14 @@ def load_local_file_for_transfer(file: str, direct_transfer: bool = False) -> IO
     return load_local_file_to_temp(file)
 
 IMAGE_HOOK_EXTENSIONS = (".jpg", ".png", ".gif")
+
+def extract_sticker_url(msg: Dict[str, Any]) -> Optional[str]:
+    message = msg.get("message") or ""
+    match = re.search(r'cdnurl\s*=\s*["\']([^"\']+)', message)
+    if match:
+        return match.group(1).replace("amp;", "")
+    url = msg.get("url")
+    return url if isinstance(url, str) and url else None
 
 def resolve_hooked_wechat_image_path(file: str) -> Optional[str]:
     """

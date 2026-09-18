@@ -41,12 +41,15 @@ def MsgProcess(
         return efb_image_wrapper(file)
 
     elif msg["type"] == "animatedsticker":
-        try:
-            url = re.search("cdnurl\s*=\s*\"(.*?)\"", msg["message"]).group(1).replace("amp;", "")
-            file = download_file(url)
-            return efb_image_wrapper(file)
-        except:
-            return efb_text_simple_wrapper("Image received and download failed. Please check it on your phone.")
+        path = msg.get("filepath")
+        if path and os.path.isfile(path):
+            file = load_local_file_for_transfer(path, direct_transfer)
+        else:
+            url = extract_sticker_url(msg)
+            if not url:
+                raise ValueError("animated sticker URL is missing")
+            file = download_file(url, retry=1, timeout=MEDIA_WAIT_SECONDS)
+        return efb_image_wrapper(file)
 
     elif msg["type"] == "share":
         if msg.get("filepath") and os.path.exists(msg["filepath"]) and ("Cache" not in msg["filepath"]):

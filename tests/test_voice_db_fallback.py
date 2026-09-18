@@ -37,6 +37,8 @@ def load_process_pending_file():
         "MsgProcess": lambda msg, _chat, _direct_transfer: msg,
         "MessageID": str,
         "MEDIA_DELETE_TYPES": {"image", "video", "file", "share"},
+        "MEDIA_RETRY_TYPES": {"image", "video", "file", "share", "animatedsticker"},
+        "MEDIA_WAIT_SECONDS": 5,
         "VOICE_DATABASE_NAMES": ("MediaMSG0.db", "MediaMSG1.db", "MediaMSG2.db"),
     }
     module = ast.Module(body=[voice_database_names, function], type_ignores=[])
