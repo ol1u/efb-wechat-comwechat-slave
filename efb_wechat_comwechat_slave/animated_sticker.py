@@ -22,11 +22,11 @@ class StickerError(Exception):
     pass
 
 
-class StickerPendingError(StickerError):
+class StickerTemporaryError(StickerError):
     pass
 
 
-class StickerTemporaryError(StickerError):
+class StickerPendingError(StickerTemporaryError):
     pass
 
 

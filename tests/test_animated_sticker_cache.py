@@ -45,6 +45,9 @@ def sticker_msg(content=b"gif", url="https://example.test/sticker"):
 
 
 class TestAnimatedStickerCache(unittest.TestCase):
+    def test_pending_download_is_a_temporary_failure(self):
+        self.assertTrue(issubclass(StickerPendingError, StickerTemporaryError))
+
     def test_extracts_required_metadata(self):
         metadata = extract_sticker_metadata(sticker_msg())
 
