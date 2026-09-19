@@ -19,7 +19,7 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
         resolver = Mock(return_value="/cache/sticker")
 
         with patch(
-            "efb_wechat_comwechat_slave.MsgProcess.load_local_file_for_transfer",
+            "efb_wechat_comwechat_slave.MsgProcess.load_local_file_to_temp",
             return_value="local-file",
         ) as load, patch(
             "efb_wechat_comwechat_slave.MsgProcess.efb_image_wrapper",
@@ -29,7 +29,7 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
 
         self.assertEqual(result, "image")
         resolver.assert_called_once_with(msg)
-        load.assert_called_once_with("/cache/sticker", False)
+        load.assert_called_once_with("/cache/sticker")
         wrap.assert_called_once_with("local-file")
 
     def test_retry_uses_downloaded_local_sticker(self):
@@ -45,7 +45,7 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
             with patch(
                 "efb_wechat_comwechat_slave.MsgProcess.download_file",
             ) as download, patch(
-                "efb_wechat_comwechat_slave.MsgProcess.load_local_file_for_transfer",
+                "efb_wechat_comwechat_slave.MsgProcess.load_local_file_to_temp",
                 return_value="local-file",
             ) as load, patch(
                 "efb_wechat_comwechat_slave.MsgProcess.efb_image_wrapper",
@@ -55,7 +55,28 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
 
         self.assertEqual(result, "image")
         download.assert_not_called()
-        load.assert_called_once_with(str(path), False)
+        load.assert_called_once_with(str(path))
+
+    def test_cached_sticker_uses_shared_temp_even_with_direct_transfer(self):
+        msg = {"type": "animatedsticker"}
+        resolver = Mock(return_value="/cache/sticker")
+
+        with patch(
+            "efb_wechat_comwechat_slave.MsgProcess.load_local_file_to_temp",
+            return_value="shared-temp",
+        ) as load, patch(
+            "efb_wechat_comwechat_slave.MsgProcess.efb_image_wrapper",
+            return_value="image",
+        ):
+            result = MsgProcess(
+                msg,
+                chat=None,
+                direct_transfer=True,
+                animated_sticker_resolver=resolver,
+            )
+
+        self.assertEqual(result, "image")
+        load.assert_called_once_with("/cache/sticker")
 
 
 if __name__ == "__main__":

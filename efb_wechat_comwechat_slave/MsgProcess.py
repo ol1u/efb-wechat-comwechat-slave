@@ -44,11 +44,11 @@ def MsgProcess(
     elif msg["type"] == "animatedsticker":
         if animated_sticker_resolver is not None:
             path = animated_sticker_resolver(msg)
-            file = load_local_file_for_transfer(path, direct_transfer)
+            file = load_local_file_to_temp(path)
         else:
             path = msg.get("filepath")
             if path and os.path.isfile(path):
-                file = load_local_file_for_transfer(path, direct_transfer)
+                file = load_local_file_to_temp(path)
             else:
                 url = extract_sticker_url(msg)
                 if not url:
