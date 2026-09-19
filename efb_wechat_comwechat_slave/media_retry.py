@@ -10,9 +10,9 @@ from ehforwarderbot.types import MessageID
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBGroupMember, EFBPrivateChat
 from .MsgProcess import MsgProcess
+from .animated_sticker import StickerPermanentError, StickerTemporaryError
 from .Utils import (
     MEDIA_WAIT_SECONDS,
-    download_file,
     extract_sticker_url,
     resolve_hooked_wechat_image_path,
 )
@@ -30,6 +30,7 @@ MEDIA_RETRY_FIELDS = (
     "wxid",
     "extrainfo",
     "thumb_path",
+    "url",
 )
 
 
@@ -40,8 +41,12 @@ class MediaRetryManager:
         self._running_lock = threading.Lock()
 
     def create(self, path, msg, author, chat, *, placeholder_uid=None):
-        source = path or extract_sticker_url(msg)
-        if not source:
+        source = (
+            extract_sticker_url(msg)
+            if msg.get("type") == "animatedsticker"
+            else path
+        )
+        if not source and msg.get("type") != "animatedsticker":
             raise ValueError("media retry source is missing")
         retry_msg = {key: msg[key] for key in MEDIA_RETRY_FIELDS if key in msg}
         retry_msg["type"] = msg.get("type")
@@ -138,23 +143,29 @@ class MediaRetryManager:
         source = media.get("source")
         media_type = media.get("type")
         placeholder_uid = media.get("placeholder_uid")
-        if media_type not in MEDIA_RETRY_TYPES or not source or not placeholder_uid:
+        if (
+            media_type not in MEDIA_RETRY_TYPES
+            or not placeholder_uid
+            or (media_type != "animatedsticker" and not source)
+        ):
             return "不支持重试此媒体"
 
-        temporary = None
         try:
             if media_type == "animatedsticker":
-                temporary = download_file(source, retry=1, timeout=MEDIA_WAIT_SECONDS)
-                media_path = temporary.name
+                msg = dict(media.get("msg") or {})
+                media_path = self.channel.sticker_cache.get_or_download(
+                    msg,
+                    wait=MEDIA_WAIT_SECONDS,
+                )
             else:
                 msg = media.get("msg") or {}
                 msgid = msg.get("msgid") or msg.get("svrid")
                 if msgid is None:
-                    return "媒体重新下载失败，请稍后再试"
+                    return self._temporary_failure(retry_id, media)
                 restored_path = self.channel.GetMsgCdn(msgid)
                 media_path = self._wait_for_media(restored_path, media_type)
                 if media_path is None:
-                    return "媒体重新下载失败，请稍后再试"
+                    return self._temporary_failure(retry_id, media)
 
             msg = dict(media.get("msg") or {})
             msg["type"] = media_type
@@ -187,21 +198,75 @@ class MediaRetryManager:
                     chat=chat,
                     uid=MessageID(f"{placeholder_uid}-retry-{time.time_ns()}"),
                 )
+        except StickerPermanentError:
+            self.channel.logger.info(
+                "Animated sticker retry is permanently unavailable: token=%s",
+                retry_id,
+            )
+            return self._permanent_sticker_failure(retry_id, media)
+        except StickerTemporaryError:
+            self.channel.logger.warning(
+                "Animated sticker retry remains unavailable: token=%s",
+                retry_id,
+                exc_info=True,
+            )
+            return self._temporary_failure(retry_id, media)
         except Exception:
             self.channel.logger.exception(
                 "Failed to retry media: type=%s token=%s",
                 media_type,
                 retry_id,
             )
-            return "媒体重试失败，请稍后再试"
-        finally:
-            if temporary is not None:
-                temporary.close()
+            return self._temporary_failure(retry_id, media)
 
         if self.channel.delete_media_after_send and media_type in MEDIA_DELETE_TYPES:
             self.delete_files(source, media_path)
         self.channel.db.delete_media_retry(retry_id)
         return "媒体重试发送成功"
+
+    def _temporary_failure(self, retry_id, media):
+        text = "媒体重新下载失败，请稍后再试"
+        try:
+            self._edit_failure(media, text, command=self.command(retry_id))
+        except Exception:
+            self.channel.logger.exception(
+                "Failed to restore retry command: token=%s",
+                retry_id,
+            )
+            return "媒体重试失败，请稍后再试"
+        return text
+
+    def _permanent_sticker_failure(self, retry_id, media):
+        text = "动态表情下载链接已失效，无法重试，请在手机端查看。"
+        try:
+            self._edit_failure(media, text)
+        except Exception:
+            self.channel.logger.exception(
+                "Failed to edit permanently unavailable sticker placeholder: token=%s",
+                retry_id,
+            )
+            return text
+        self.channel.db.delete_media_retry(retry_id)
+        return text
+
+    def _edit_failure(self, media, text, command=None):
+        chat, author = self._build_context(media)
+        failed_msg = dict(media.get("msg") or {})
+        failed_msg["type"] = "text"
+        failed_msg["message"] = text
+        messages = self._as_list(
+            MsgProcess(failed_msg, chat, self.channel.direct_transfer)
+        )
+        commands = MessageCommands([command]) if command is not None else None
+        for message in messages:
+            message.commands = commands
+        self.channel.send_efb_msgs(
+            messages,
+            author=author,
+            chat=chat,
+            uid=MessageID(media["placeholder_uid"]),
+            edit=True,
+        )
 
     def _wait_for_media(self, path, media_type):
         if not isinstance(path, str) or not path:

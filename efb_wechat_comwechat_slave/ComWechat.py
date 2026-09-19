@@ -33,6 +33,7 @@ from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
 from .MsgDeco import qutoed_text
 from .MsgProcess import MsgProcess
+from .animated_sticker import AnimatedStickerCache
 from .Utils import (
     download_file,
     load_config,
@@ -101,6 +102,9 @@ class ComWeChatChannel(SlaveChannel):
         self.mark_as_read_timers: Dict[str, threading.Timer] = {}
         self.mark_as_read_lock = threading.RLock()
         self.db: DatabaseManager = DatabaseManager(self)
+        self.sticker_cache = AnimatedStickerCache(
+            efb_utils.get_data_path(self.channel_id) / "animated_sticker_cache"
+        )
         self.media_retries = MediaRetryManager(self)
         self.bot = WeChatRobot()
 
@@ -618,7 +622,20 @@ class ComWeChatChannel(SlaveChannel):
             return
 
         try:
-            processed = MsgProcess(msg, chat, self.direct_transfer, self._message_references)
+            if msg.get("type") == "animatedsticker":
+                processed = MsgProcess(
+                    msg,
+                    chat,
+                    self.direct_transfer,
+                    animated_sticker_resolver=self._resolve_animated_sticker,
+                )
+            else:
+                processed = MsgProcess(
+                    msg,
+                    chat,
+                    self.direct_transfer,
+                    self._message_references,
+                )
             self.send_efb_msgs(
                 processed,
                 author=author,
@@ -746,6 +763,9 @@ class ComWeChatChannel(SlaveChannel):
 
     def retry_media(self, retry_id):
         return self.media_retries.retry(retry_id)
+
+    def _resolve_animated_sticker(self, msg):
+        return self.sticker_cache.get_or_download(msg, wait=MEDIA_WAIT_SECONDS)
 
     def GetMsgCdn(self, msgid):
         try:
@@ -876,7 +896,15 @@ class ComWeChatChannel(SlaveChannel):
                 break
 
         if flag:
-            processed = MsgProcess(output_msg, chat, self.direct_transfer)
+            if output_msg.get("type") == "animatedsticker":
+                processed = MsgProcess(
+                    output_msg,
+                    chat,
+                    self.direct_transfer,
+                    animated_sticker_resolver=self._resolve_animated_sticker,
+                )
+            else:
+                processed = MsgProcess(output_msg, chat, self.direct_transfer)
             self.send_efb_msgs(
                 processed,
                 author=author,
@@ -1382,7 +1410,15 @@ class ComWeChatChannel(SlaveChannel):
             return None
 
         try:
-            processed = MsgProcess(data, chat, self.direct_transfer)
+            if data.get("type") == "animatedsticker":
+                processed = MsgProcess(
+                    data,
+                    chat,
+                    self.direct_transfer,
+                    animated_sticker_resolver=self._resolve_animated_sticker,
+                )
+            else:
+                processed = MsgProcess(data, chat, self.direct_transfer)
         except Exception:
             self.logger.debug("Failed to convert native message: %s", msg_id, exc_info=True)
             return None

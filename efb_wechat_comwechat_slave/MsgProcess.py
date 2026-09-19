@@ -10,6 +10,7 @@ def MsgProcess(
     chat,
     direct_transfer: bool = False,
     message_reference_resolver=None,
+    animated_sticker_resolver=None,
 ) -> Union[Message, List[Message]]:
 
     if msg["type"] == "text":
@@ -41,14 +42,18 @@ def MsgProcess(
         return efb_image_wrapper(file)
 
     elif msg["type"] == "animatedsticker":
-        path = msg.get("filepath")
-        if path and os.path.isfile(path):
+        if animated_sticker_resolver is not None:
+            path = animated_sticker_resolver(msg)
             file = load_local_file_for_transfer(path, direct_transfer)
         else:
-            url = extract_sticker_url(msg)
-            if not url:
-                raise ValueError("animated sticker URL is missing")
-            file = download_file(url, retry=1, timeout=MEDIA_WAIT_SECONDS)
+            path = msg.get("filepath")
+            if path and os.path.isfile(path):
+                file = load_local_file_for_transfer(path, direct_transfer)
+            else:
+                url = extract_sticker_url(msg)
+                if not url:
+                    raise ValueError("animated sticker URL is missing")
+                file = download_file(url, retry=1, timeout=MEDIA_WAIT_SECONDS)
         return efb_image_wrapper(file)
 
     elif msg["type"] == "share":

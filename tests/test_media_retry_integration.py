@@ -62,6 +62,7 @@ class TestMediaRetryIntegration(unittest.TestCase):
             media_retries=retry_manager,
             logger=logging.getLogger("test-media-retry"),
             _message_references=Mock(return_value=[]),
+            _resolve_animated_sticker=Mock(),
             _schedule_mark_as_read=Mock(),
             send_efb_msgs=Mock(),
         )

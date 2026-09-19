@@ -7,6 +7,10 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from efb_wechat_comwechat_slave.media_retry import MediaRetryManager
+from efb_wechat_comwechat_slave.animated_sticker import (
+    StickerPermanentError,
+    StickerTemporaryError,
+)
 
 
 class FakeStore:
@@ -37,12 +41,14 @@ class FakeChannel:
         self.delete_media_after_send = False
         self.wxid = "wxid_self"
         self.logger = types.SimpleNamespace(
+            info=lambda *args, **kwargs: None,
             warning=lambda *args, **kwargs: None,
             exception=lambda *args, **kwargs: None,
         )
         self.sent = []
         self.fail_edit = False
         self.cdn_path = None
+        self.sticker_cache = Mock()
 
     def send_efb_msgs(self, messages, **kwargs):
         if kwargs.get("edit") and self.fail_edit:
@@ -238,21 +244,59 @@ class TestMediaRetryManager(unittest.TestCase):
         self.assertEqual(results, ["done"])
         run.assert_called_once_with("token")
 
-    def test_animated_sticker_retry_uses_downloaded_local_file(self):
-        retry_id = self.create(
-            "https://example.test/a.gif",
-            media_type="animatedsticker",
+    def test_animated_sticker_source_uses_xml_url_instead_of_filepath(self):
+        retry_id = self.manager.create(
+            "opaque-wechat-file-id",
+            {
+                "type": "animatedsticker",
+                "message": '<emoji cdnurl="https://example.test/a.gif" />',
+                "msgid": 123,
+            },
+            self.author,
+            self.chat,
         )
+
+        self.assertEqual(
+            self.channel.db.rows[retry_id]["source"],
+            "https://example.test/a.gif",
+        )
+
+    def test_cached_animated_sticker_retry_does_not_require_url(self):
+        msg = {
+            "type": "animatedsticker",
+            "message": '<emoji md5="b3d6e13019b0571658e5c2c8e8b6d7a9" len="3" />',
+            "msgid": 123,
+        }
+        retry_id = self.manager.create("opaque", msg, self.author, self.chat)
+        self.channel.sticker_cache.get_or_download.return_value = "/cache/sticker"
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            return_value=FakeMessage(),
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ):
+            result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "媒体重试发送成功")
+
+    def test_animated_sticker_retry_uses_shared_cache(self):
+        msg = {
+            "type": "animatedsticker",
+            "message": '<emoji cdnurl="https://example.test/a.gif" />',
+            "msgid": 123,
+        }
+        retry_id = self.manager.create("opaque-wechat-file-id", msg, self.author, self.chat)
         seen = {}
 
         def convert(msg, _chat, _direct):
             seen.update(msg)
             return FakeMessage()
 
-        with tempfile.NamedTemporaryFile() as downloaded, patch(
-            "efb_wechat_comwechat_slave.media_retry.download_file",
-            return_value=downloaded,
-        ) as download, patch(
+        self.channel.sticker_cache.get_or_download.return_value = "/cache/sticker"
+        with patch(
             "efb_wechat_comwechat_slave.media_retry.MsgProcess",
             side_effect=convert,
         ), patch.object(
@@ -261,15 +305,80 @@ class TestMediaRetryManager(unittest.TestCase):
             return_value=(self.chat, self.author),
         ):
             result = self.manager.retry(retry_id)
-            downloaded_path = downloaded.name
 
         self.assertEqual(result, "媒体重试发送成功")
-        download.assert_called_once_with(
-            "https://example.test/a.gif",
-            retry=1,
-            timeout=5,
+        self.channel.sticker_cache.get_or_download.assert_called_once_with(
+            dict(msg, filepath="opaque-wechat-file-id"),
+            wait=5,
         )
-        self.assertEqual(seen["filepath"], downloaded_path)
+        self.assertEqual(seen["filepath"], "/cache/sticker")
+
+    def test_temporary_sticker_failure_edits_placeholder_and_restores_command(self):
+        retry_id = self.manager.create(
+            "opaque",
+            {
+                "type": "animatedsticker",
+                "message": '<emoji cdnurl="https://example.test/a.gif" />',
+                "msgid": 123,
+            },
+            self.author,
+            self.chat,
+        )
+        self.channel.sticker_cache.get_or_download.side_effect = StickerTemporaryError(
+            "temporary"
+        )
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            return_value=FakeMessage(),
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ):
+            result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "媒体重新下载失败，请稍后再试")
+        messages, kwargs = self.channel.sent[0]
+        message = messages[0]
+        self.assertEqual(kwargs["uid"], "123")
+        self.assertTrue(kwargs["edit"])
+        self.assertTrue(message.commands)
+        self.assertEqual(message.commands[0].kwargs["retry_id"], retry_id)
+        self.assertIn(retry_id, self.channel.db.rows)
+
+    def test_permanent_sticker_failure_edits_placeholder_and_consumes_token(self):
+        retry_id = self.manager.create(
+            "opaque",
+            {
+                "type": "animatedsticker",
+                "message": '<emoji cdnurl="https://example.test/a.gif" />',
+                "msgid": 123,
+            },
+            self.author,
+            self.chat,
+        )
+        self.channel.sticker_cache.get_or_download.side_effect = StickerPermanentError(
+            "expired"
+        )
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            return_value=FakeMessage(),
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ):
+            result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "动态表情下载链接已失效，无法重试，请在手机端查看。")
+        messages, kwargs = self.channel.sent[0]
+        message = messages[0]
+        self.assertEqual(kwargs["uid"], "123")
+        self.assertTrue(kwargs["edit"])
+        self.assertFalse(message.commands)
+        self.assertNotIn(retry_id, self.channel.db.rows)
 
 
 if __name__ == "__main__":

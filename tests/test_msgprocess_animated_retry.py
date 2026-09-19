@@ -11,29 +11,26 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "animated sticker URL is missing"):
             MsgProcess({"type": "animatedsticker"}, chat=None)
 
-    def test_initial_download_uses_single_five_second_attempt(self):
-        downloaded = object()
+    def test_initial_download_uses_sticker_cache_resolver(self):
         msg = {
             "type": "animatedsticker",
             "message": '<emoji cdnurl="https://example.test/a.gif" />',
         }
+        resolver = Mock(return_value="/cache/sticker")
 
         with patch(
-            "efb_wechat_comwechat_slave.MsgProcess.download_file",
-            return_value=downloaded,
-        ) as download, patch(
+            "efb_wechat_comwechat_slave.MsgProcess.load_local_file_for_transfer",
+            return_value="local-file",
+        ) as load, patch(
             "efb_wechat_comwechat_slave.MsgProcess.efb_image_wrapper",
             return_value="image",
         ) as wrap:
-            result = MsgProcess(msg, chat=None)
+            result = MsgProcess(msg, chat=None, animated_sticker_resolver=resolver)
 
         self.assertEqual(result, "image")
-        download.assert_called_once_with(
-            "https://example.test/a.gif",
-            retry=1,
-            timeout=5,
-        )
-        wrap.assert_called_once_with(downloaded)
+        resolver.assert_called_once_with(msg)
+        load.assert_called_once_with("/cache/sticker", False)
+        wrap.assert_called_once_with("local-file")
 
     def test_retry_uses_downloaded_local_sticker(self):
         with tempfile.TemporaryDirectory() as tmpdir:
