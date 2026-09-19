@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import json
 import tempfile
 import threading
@@ -338,7 +340,7 @@ class TestMediaRetryManager(unittest.TestCase):
         ):
             result = self.manager.retry(retry_id)
 
-        self.assertEqual(result, "媒体重新下载失败，请稍后再试")
+        self.assertIsNone(result)
         messages, kwargs = self.channel.sent[0]
         message = messages[0]
         self.assertEqual(kwargs["uid"], "123")
@@ -346,6 +348,74 @@ class TestMediaRetryManager(unittest.TestCase):
         self.assertTrue(message.commands)
         self.assertEqual(message.commands[0].kwargs["retry_id"], retry_id)
         self.assertIn(retry_id, self.channel.db.rows)
+
+    def test_share_sticker_falls_back_to_sticker_cache_when_get_cdn_fails(self):
+        content = b"gif"
+        digest = hashlib.md5(content).hexdigest()
+        url = "https://example.test/sticker?m={}".format(digest)
+        emojiinfo = base64.b64encode(url.encode()).decode()
+        msg = {
+            "type": "share",
+            "message": (
+                "<msg><appmsg><type>8</type><appattach>"
+                "<totallen>{}</totallen><emoticonmd5>{}</emoticonmd5>"
+                "<emojiinfo>{}</emojiinfo>"
+                "</appattach></appmsg></msg>"
+            ).format(len(content), digest, emojiinfo),
+            "msgid": 123,
+        }
+        retry_id = self.manager.create("/missing/sticker.gif", msg, self.author, self.chat)
+        self.channel.cdn_path = None
+        self.channel.sticker_cache.get_or_download.return_value = "/cache/sticker"
+        seen = {}
+
+        def convert(converted, _chat, _direct):
+            seen.update(converted)
+            return FakeMessage()
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            side_effect=convert,
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ), patch.object(self.manager, "delete_files") as delete_files:
+            result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "媒体重试发送成功")
+        self.channel.sticker_cache.get_or_download.assert_called_once_with(
+            dict(msg, filepath="/missing/sticker.gif"),
+            wait=5,
+        )
+        self.assertEqual(seen["type"], "animatedsticker")
+        self.assertEqual(seen["filepath"], "/cache/sticker")
+        delete_files.assert_not_called()
+
+    def test_regular_share_does_not_use_sticker_cache_when_get_cdn_fails(self):
+        retry_id = self.manager.create(
+            "/missing/file",
+            {
+                "type": "share",
+                "message": "<msg><appmsg><type>6</type></appmsg></msg>",
+                "msgid": 123,
+            },
+            self.author,
+            self.chat,
+        )
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            return_value=FakeMessage(),
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ):
+            result = self.manager.retry(retry_id)
+
+        self.assertIsNone(result)
+        self.channel.sticker_cache.get_or_download.assert_not_called()
 
     def test_permanent_sticker_failure_edits_placeholder_and_consumes_token(self):
         retry_id = self.manager.create(

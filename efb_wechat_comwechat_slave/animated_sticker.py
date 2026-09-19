@@ -1,10 +1,13 @@
+import base64
 import hashlib
 import html
 import logging
 import os
 import re
 import threading
+import urllib.parse
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
@@ -52,8 +55,67 @@ class _DownloadState:
         self.error: Optional[Exception] = None
 
 
+def is_sticker_share(msg: dict) -> bool:
+    if msg.get("type") != "share":
+        return False
+    try:
+        root = ET.fromstring(msg.get("message") or "")
+    except (ET.ParseError, TypeError):
+        return False
+    return root.findtext("./appmsg/type") == "8"
+
+
+def _extract_share_metadata(message: str) -> StickerMetadata:
+    try:
+        root = ET.fromstring(message)
+    except (ET.ParseError, TypeError) as exc:
+        raise StickerPermanentError("sticker share XML is invalid") from exc
+    appmsg = root.find("./appmsg")
+    if appmsg is None or appmsg.findtext("type") != "8":
+        raise StickerPermanentError("message is not a sticker share")
+    attachment = appmsg.find("./appattach")
+    if attachment is None:
+        raise StickerPermanentError("sticker share attachment is missing")
+
+    digest = attachment.findtext("emoticonmd5")
+    declared_length = attachment.findtext("totallen")
+    emojiinfo = attachment.findtext("emojiinfo") or ""
+    url = None
+    try:
+        decoded = base64.b64decode(emojiinfo)
+    except (ValueError, TypeError) as exc:
+        raise StickerPermanentError("sticker share emoji info is invalid") from exc
+    if isinstance(digest, str):
+        for raw_url in re.findall(rb"https?://[^\x00-\x20<>\"]+", decoded):
+            candidate = html.unescape(raw_url.decode("utf-8", errors="ignore"))
+            query = urllib.parse.parse_qs(urllib.parse.urlsplit(candidate).query)
+            if any(value.lower() == digest.lower() for value in query.get("m", ())):
+                url = candidate
+                break
+    return StickerMetadata(
+        md5=digest.lower() if isinstance(digest, str) else "",
+        length=_validated_length(declared_length),
+        url=url,
+    )
+
+
+def _validated_length(value: Optional[str]) -> int:
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        raise StickerPermanentError("animated sticker length is missing or invalid")
+    if length <= 0:
+        raise StickerPermanentError("animated sticker length is invalid")
+    return length
+
+
 def extract_sticker_metadata(msg: dict) -> StickerMetadata:
     message = msg.get("message") or ""
+    if msg.get("type") == "share":
+        metadata = _extract_share_metadata(message)
+        if not re.fullmatch(r"[0-9a-f]{32}", metadata.md5):
+            raise StickerPermanentError("animated sticker MD5 is missing or invalid")
+        return metadata
 
     def attribute(name: str) -> Optional[str]:
         match = re.search(r"\b{}\s*=\s*['\"]([^'\"]+)".format(name), message)
@@ -64,12 +126,7 @@ def extract_sticker_metadata(msg: dict) -> StickerMetadata:
     url = attribute("cdnurl") or msg.get("url")
     if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", digest):
         raise StickerPermanentError("animated sticker MD5 is missing or invalid")
-    try:
-        length = int(declared_length)
-    except (TypeError, ValueError):
-        raise StickerPermanentError("animated sticker length is missing or invalid")
-    if length <= 0:
-        raise StickerPermanentError("animated sticker length is invalid")
+    length = _validated_length(declared_length)
     if not isinstance(url, str) or not url:
         url = None
     return StickerMetadata(md5=digest.lower(), length=length, url=url)
@@ -166,8 +223,18 @@ class AnimatedStickerCache:
             self._trim(protected=target)
             state.path = str(target)
         except StickerError as exc:
+            self.logger.warning(
+                "Animated sticker download failed: key=%s error=%s",
+                metadata.key,
+                exc,
+            )
             state.error = exc
         except requests.RequestException as exc:
+            self.logger.warning(
+                "Animated sticker request failed: key=%s error=%s",
+                metadata.key,
+                exc,
+            )
             state.error = StickerTemporaryError(str(exc))
         except Exception as exc:
             self.logger.warning(

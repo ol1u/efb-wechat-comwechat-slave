@@ -10,7 +10,11 @@ from ehforwarderbot.types import MessageID
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBGroupMember, EFBPrivateChat
 from .MsgProcess import MsgProcess
-from .animated_sticker import StickerPermanentError, StickerTemporaryError
+from .animated_sticker import (
+    StickerPermanentError,
+    StickerTemporaryError,
+    is_sticker_share,
+)
 from .Utils import (
     MEDIA_WAIT_SECONDS,
     extract_sticker_url,
@@ -151,10 +155,11 @@ class MediaRetryManager:
             return "不支持重试此媒体"
 
         try:
+            msg = dict(media.get("msg") or {})
+            conversion_type = media_type
             if media_type == "animatedsticker":
-                msg = dict(media.get("msg") or {})
                 media_path = self.channel.sticker_cache.get_or_download(
-                    msg,
+                    dict(msg),
                     wait=MEDIA_WAIT_SECONDS,
                 )
             else:
@@ -165,10 +170,16 @@ class MediaRetryManager:
                 restored_path = self.channel.GetMsgCdn(msgid)
                 media_path = self._wait_for_media(restored_path, media_type)
                 if media_path is None:
-                    return self._temporary_failure(retry_id, media)
+                    if media_type == "share" and is_sticker_share(msg):
+                        media_path = self.channel.sticker_cache.get_or_download(
+                            dict(msg),
+                            wait=MEDIA_WAIT_SECONDS,
+                        )
+                        conversion_type = "animatedsticker"
+                    else:
+                        return self._temporary_failure(retry_id, media)
 
-            msg = dict(media.get("msg") or {})
-            msg["type"] = media_type
+            msg["type"] = conversion_type
             msg["filepath"] = media_path
             chat, author = self._build_context(media)
             try:
@@ -219,7 +230,11 @@ class MediaRetryManager:
             )
             return self._temporary_failure(retry_id, media)
 
-        if self.channel.delete_media_after_send and media_type in MEDIA_DELETE_TYPES:
+        if (
+            self.channel.delete_media_after_send
+            and media_type in MEDIA_DELETE_TYPES
+            and conversion_type != "animatedsticker"
+        ):
             self.delete_files(source, media_path)
         self.channel.db.delete_media_retry(retry_id)
         return "媒体重试发送成功"
@@ -234,7 +249,7 @@ class MediaRetryManager:
                 retry_id,
             )
             return "媒体重试失败，请稍后再试"
-        return text
+        return None
 
     def _permanent_sticker_failure(self, retry_id, media):
         text = "动态表情下载链接已失效，无法重试，请在手机端查看。"
