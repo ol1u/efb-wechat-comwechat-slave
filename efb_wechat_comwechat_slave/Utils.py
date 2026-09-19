@@ -99,14 +99,30 @@ def wechatimagedecode( file : str) -> tempfile:
     f.close()
     return ret_file
 
+def detect_image_suffix(file: str) -> str:
+    with open(file, "rb") as source:
+        header = source.read(16)
+    if header.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if header.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
 def load_local_file_to_temp(file : str) -> tempfile:
     """
     从本地文件读取文件到临时文件
     """
-    ret_file = tempfile.NamedTemporaryFile()
+    suffix = detect_image_suffix(file) or os.path.splitext(file)[1]
+    ret_file = tempfile.NamedTemporaryFile(suffix=suffix)
     with open(file , 'rb') as f:
         ret_file.write(f.read())
-    f.close()
+    ret_file.flush()
+    ret_file.seek(0)
     return ret_file
 
 def load_local_file_for_transfer(file: str, direct_transfer: bool = False) -> IO[bytes]:

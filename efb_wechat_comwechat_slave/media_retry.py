@@ -157,27 +157,22 @@ class MediaRetryManager:
         try:
             msg = dict(media.get("msg") or {})
             conversion_type = media_type
-            if media_type == "animatedsticker":
+            if media_type == "animatedsticker" or (
+                media_type == "share" and is_sticker_share(msg)
+            ):
                 media_path = self.channel.sticker_cache.get_or_download(
                     dict(msg),
                     wait=MEDIA_WAIT_SECONDS,
                 )
+                conversion_type = "animatedsticker"
             else:
-                msg = media.get("msg") or {}
                 msgid = msg.get("msgid") or msg.get("svrid")
                 if msgid is None:
                     return self._temporary_failure(retry_id, media)
                 restored_path = self.channel.GetMsgCdn(msgid)
                 media_path = self._wait_for_media(restored_path, media_type)
                 if media_path is None:
-                    if media_type == "share" and is_sticker_share(msg):
-                        media_path = self.channel.sticker_cache.get_or_download(
-                            dict(msg),
-                            wait=MEDIA_WAIT_SECONDS,
-                        )
-                        conversion_type = "animatedsticker"
-                    else:
-                        return self._temporary_failure(retry_id, media)
+                    return self._temporary_failure(retry_id, media)
 
             msg["type"] = conversion_type
             msg["filepath"] = media_path

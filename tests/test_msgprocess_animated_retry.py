@@ -78,6 +78,31 @@ class TestAnimatedStickerProcessing(unittest.TestCase):
         self.assertEqual(result, "image")
         load.assert_called_once_with("/cache/sticker")
 
+    def test_cached_gif_sticker_uses_a_gif_suffixed_shared_temp_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "md5-length"
+            path.write_bytes(b"GIF89a" + b"\x00" * 16)
+            seen = {}
+
+            def wrap(file):
+                seen["name"] = file.name
+                seen["content"] = file.read()
+                file.close()
+                return "animation"
+
+            with patch(
+                "efb_wechat_comwechat_slave.MsgProcess.efb_image_wrapper",
+                side_effect=wrap,
+            ):
+                result = MsgProcess(
+                    {"type": "animatedsticker", "filepath": str(path)},
+                    chat=None,
+                )
+
+        self.assertEqual(result, "animation")
+        self.assertEqual(Path(seen["name"]).suffix, ".gif")
+        self.assertTrue(seen["content"].startswith(b"GIF89a"))
+
 
 if __name__ == "__main__":
     unittest.main()

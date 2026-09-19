@@ -349,7 +349,7 @@ class TestMediaRetryManager(unittest.TestCase):
         self.assertEqual(message.commands[0].kwargs["retry_id"], retry_id)
         self.assertIn(retry_id, self.channel.db.rows)
 
-    def test_share_sticker_falls_back_to_sticker_cache_when_get_cdn_fails(self):
+    def test_share_sticker_uses_sticker_cache_without_get_cdn(self):
         content = b"gif"
         digest = hashlib.md5(content).hexdigest()
         url = "https://example.test/sticker?m={}".format(digest)
@@ -365,7 +365,9 @@ class TestMediaRetryManager(unittest.TestCase):
             "msgid": 123,
         }
         retry_id = self.manager.create("/missing/sticker.gif", msg, self.author, self.chat)
-        self.channel.cdn_path = None
+        self.channel.GetMsgCdn = Mock(
+            side_effect=AssertionError("sticker share must not call GetMsgCdn")
+        )
         self.channel.sticker_cache.get_or_download.return_value = "/cache/sticker"
         seen = {}
 
@@ -384,6 +386,7 @@ class TestMediaRetryManager(unittest.TestCase):
             result = self.manager.retry(retry_id)
 
         self.assertEqual(result, "媒体重试发送成功")
+        self.channel.GetMsgCdn.assert_not_called()
         self.channel.sticker_cache.get_or_download.assert_called_once_with(
             dict(msg, filepath="/missing/sticker.gif"),
             wait=5,
