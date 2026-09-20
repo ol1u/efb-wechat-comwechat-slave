@@ -120,8 +120,42 @@ class DatabaseManager:
         retry = MediaRetry.get_or_none(MediaRetry.token == token)
         if retry is None:
             return None
+        return DatabaseManager._decode_media_retry(token, retry.payload)
+
+    @staticmethod
+    def list_media_retries():
+        retries = []
+        query = MediaRetry.select().order_by(
+            MediaRetry.created_at.desc(),
+            MediaRetry.token.desc(),
+        )
+        for retry in query:
+            payload = DatabaseManager._decode_media_retry(
+                retry.token,
+                retry.payload,
+            )
+            if payload is not None:
+                retries.append((retry.token, payload))
+        return retries
+
+    @staticmethod
+    def update_media_retry(token, payload):
+        return (
+            MediaRetry.update(
+                payload=json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            .where(MediaRetry.token == token)
+            .execute()
+        )
+
+    @staticmethod
+    def _decode_media_retry(token, raw_payload):
         try:
-            payload = json.loads(retry.payload)
+            payload = json.loads(raw_payload)
         except (TypeError, ValueError):
             DatabaseManager.logger.warning(
                 "Ignoring invalid media retry payload: token=%s",

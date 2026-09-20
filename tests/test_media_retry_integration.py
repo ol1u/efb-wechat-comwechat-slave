@@ -1,4 +1,5 @@
 import logging
+import threading
 import time
 import types
 import unittest
@@ -15,6 +16,41 @@ class FakeMessage:
 
 
 class TestMediaRetryIntegration(unittest.TestCase):
+    def test_poll_starts_retry_worker_after_native_is_ready(self):
+        calls = []
+        retry_manager = types.SimpleNamespace(start=lambda: calls.append("retry"))
+        bot = types.SimpleNamespace(run=lambda **_kwargs: calls.append("native") or True)
+        channel = types.SimpleNamespace(
+            bot=bot,
+            media_retries=retry_manager,
+            scheduled_job=Mock(),
+            handle_file_msg=Mock(),
+            logger=logging.getLogger("test-media-retry"),
+        )
+
+        with patch("efb_wechat_comwechat_slave.ComWechat.time.sleep"), patch(
+            "efb_wechat_comwechat_slave.ComWechat.threading.Thread"
+        ) as thread:
+            ComWeChatChannel.poll(channel)
+
+        self.assertEqual(calls, ["native", "retry"])
+        self.assertEqual(thread.call_count, 2)
+
+    def test_stop_polling_stops_retry_worker_before_database(self):
+        calls = []
+        channel = types.SimpleNamespace(
+            mark_as_read_lock=threading.Lock(),
+            mark_as_read_timers={},
+            media_retries=types.SimpleNamespace(
+                stop=lambda: calls.append("retry")
+            ),
+            db=types.SimpleNamespace(stop_worker=lambda: calls.append("db")),
+        )
+
+        ComWeChatChannel.stop_polling(channel)
+
+        self.assertEqual(calls, ["retry", "db"])
+
     def test_pending_media_uses_fixed_five_second_timeout(self):
         path = "/missing/video.mp4"
         message = {

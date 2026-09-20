@@ -1325,6 +1325,7 @@ class ComWeChatChannel(SlaveChannel):
             except Exception as e:
                 self.logger.error("Start failed. Reason: %s" % e)
 
+        self.media_retries.start()
         t = threading.Thread(target = self.handle_file_msg)
         t.daemon = True
         t.start()
@@ -1381,6 +1382,7 @@ class ComWeChatChannel(SlaveChannel):
             self.mark_as_read_timers.clear()
         for timer in timers:
             timer.cancel()
+        self.media_retries.stop()
         self.db.stop_worker()
 
     def get_message_by_id(self, chat: 'Chat', msg_id: MessageID) -> Optional['Message']:

@@ -54,6 +54,44 @@ class TestMediaRetryStore(unittest.TestCase):
         row = db_module.MediaRetry.get_by_id("token-json")
         self.assertEqual(json.loads(row.payload), payload)
 
+    def test_list_retries_returns_valid_payloads_latest_first(self):
+        db_module.DatabaseManager.save_media_retry(
+            "older", {"type": "video"}, created_at=1
+        )
+        db_module.DatabaseManager.save_media_retry(
+            "newer", {"type": "image"}, created_at=2
+        )
+        db_module.MediaRetry.create(token="invalid", created_at=3, payload="[]")
+
+        self.assertEqual(
+            db_module.DatabaseManager.list_media_retries(),
+            [("newer", {"type": "image"}), ("older", {"type": "video"})],
+        )
+
+    def test_update_retry_preserves_created_at_and_does_not_recreate(self):
+        db_module.DatabaseManager.save_media_retry(
+            "token-update", {"attempts": 0}, created_at=10
+        )
+
+        self.assertEqual(
+            db_module.DatabaseManager.update_media_retry(
+                "token-update", {"attempts": 1}
+            ),
+            1,
+        )
+        row = db_module.MediaRetry.get_by_id("token-update")
+        self.assertEqual(row.created_at, 10)
+        self.assertEqual(json.loads(row.payload), {"attempts": 1})
+
+        db_module.DatabaseManager.delete_media_retry("token-update")
+        self.assertEqual(
+            db_module.DatabaseManager.update_media_retry(
+                "token-update", {"attempts": 2}
+            ),
+            0,
+        )
+        self.assertIsNone(db_module.DatabaseManager.get_media_retry("token-update"))
+
 
 if __name__ == "__main__":
     unittest.main()
