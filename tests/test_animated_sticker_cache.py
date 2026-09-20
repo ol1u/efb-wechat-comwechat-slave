@@ -130,6 +130,23 @@ class TestAnimatedStickerCache(unittest.TestCase):
         self.assertEqual(Path(path).name, "{}-{}".format(metadata.md5, metadata.length))
         request.assert_called_once()
 
+    def test_matching_md5_allows_incorrect_declared_length(self):
+        content = b"\x89PNG\r\n\x1a\nfull-sticker-content"
+        msg = sticker_msg(content=content)
+        msg["message"] = re.sub(r' len="[^"]+"', ' len="7"', msg["message"])
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "efb_wechat_comwechat_slave.animated_sticker.requests.get",
+            return_value=FakeResponse(content=content),
+        ):
+            path = AnimatedStickerCache(Path(tmpdir)).get_or_download(msg, wait=1)
+
+            self.assertEqual(Path(path).read_bytes(), content)
+            self.assertEqual(
+                Path(path).name,
+                "{}-7".format(hashlib.md5(content).hexdigest()),
+            )
+
     def test_wait_timeout_keeps_single_background_download_running(self):
         release = threading.Event()
         with tempfile.TemporaryDirectory() as tmpdir:

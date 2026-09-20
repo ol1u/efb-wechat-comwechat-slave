@@ -208,13 +208,6 @@ class AnimatedStickerCache:
 
             if length == 0:
                 raise StickerTemporaryError("animated sticker CDN returned an empty file")
-            if length != metadata.length:
-                raise StickerTemporaryError(
-                    "animated sticker length mismatch: expected {}, got {}".format(
-                        metadata.length,
-                        length,
-                    )
-                )
             if digest.hexdigest() != metadata.md5:
                 raise StickerTemporaryError("animated sticker MD5 mismatch")
 
