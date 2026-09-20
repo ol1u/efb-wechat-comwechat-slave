@@ -24,6 +24,13 @@ from .Utils import (
 
 MEDIA_DELETE_TYPES = {"image", "video", "file", "share"}
 MEDIA_RETRY_TYPES = MEDIA_DELETE_TYPES | {"animatedsticker"}
+MEDIA_TYPE_NAMES = {
+    "image": "图片",
+    "video": "视频",
+    "file": "文件",
+    "share": "媒体",
+    "animatedsticker": "动态表情",
+}
 MEDIA_RETRY_FIELDS = (
     "type",
     "message",
@@ -274,7 +281,8 @@ class MediaRetryManager:
         return "媒体重试发送成功"
 
     def _temporary_failure(self, retry_id, media, *, automatic=False):
-        text = "媒体重新下载失败，请稍后再试"
+        media_name = MEDIA_TYPE_NAMES.get(media.get("type"), "媒体")
+        text = f"{media_name}重新下载失败，请稍后再试"
         self._reschedule(retry_id, media, automatic=automatic)
         try:
             self._edit_failure(media, text, command=self.command(retry_id))
@@ -283,7 +291,7 @@ class MediaRetryManager:
                 "Failed to restore retry command: token=%s",
                 retry_id,
             )
-            return "媒体重试失败，请稍后再试"
+            return f"{media_name}重试失败，请稍后再试"
         return None
 
     def _reschedule(self, retry_id, media, *, automatic):
