@@ -196,21 +196,23 @@ class MediaRetryManager:
                 )
                 conversion_type = "animatedsticker"
             else:
-                msgid = msg.get("msgid") or msg.get("svrid")
-                if msgid is None:
-                    return self._temporary_failure(
-                        retry_id,
-                        media,
-                        automatic=automatic,
-                    )
-                restored_path = self.channel.GetMsgCdn(msgid)
-                media_path = self._wait_for_media(restored_path, media_type)
+                media_path = self._existing_media_path(source, media_type)
                 if media_path is None:
-                    return self._temporary_failure(
-                        retry_id,
-                        media,
-                        automatic=automatic,
-                    )
+                    msgid = msg.get("msgid") or msg.get("svrid")
+                    if msgid is None:
+                        return self._temporary_failure(
+                            retry_id,
+                            media,
+                            automatic=automatic,
+                        )
+                    restored_path = self.channel.GetMsgCdn(msgid)
+                    media_path = self._wait_for_media(restored_path, media_type)
+                    if media_path is None:
+                        return self._temporary_failure(
+                            retry_id,
+                            media,
+                            automatic=automatic,
+                        )
 
             msg["type"] = conversion_type
             msg["filepath"] = media_path

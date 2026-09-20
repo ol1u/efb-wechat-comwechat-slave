@@ -152,11 +152,13 @@ class TestMediaRetryManager(unittest.TestCase):
 
         self.assertEqual(self.channel.db.rows, {})
 
-    def test_success_redownloads_and_edits_placeholder_then_consumes_token(self):
+    def test_existing_source_edits_placeholder_without_redownloading(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = str(Path(tmpdir) / "video.mp4")
             Path(path).write_bytes(b"video")
-            self.channel.GetMsgCdn = Mock(return_value=path)
+            self.channel.GetMsgCdn = Mock(
+                side_effect=AssertionError("existing source must not be redownloaded")
+            )
             retry_id = self.create(path)
 
             with patch(
@@ -174,7 +176,7 @@ class TestMediaRetryManager(unittest.TestCase):
         self.assertEqual(kwargs["uid"], "123")
         self.assertTrue(kwargs["edit"])
         self.assertTrue(kwargs["edit_media"])
-        self.channel.GetMsgCdn.assert_called_once_with(123)
+        self.channel.GetMsgCdn.assert_not_called()
         self.assertNotIn(retry_id, self.channel.db.rows)
 
     def test_edit_failure_sends_media_as_reply_to_placeholder(self):
