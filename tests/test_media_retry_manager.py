@@ -8,7 +8,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from efb_wechat_comwechat_slave.media_retry import MediaRetryManager
+from efb_wechat_comwechat_slave.media_retry import (
+    MediaPermanentlyUnavailable,
+    MediaRetryManager,
+)
 from efb_wechat_comwechat_slave.animated_sticker import (
     StickerPermanentError,
     StickerTemporaryError,
@@ -136,6 +139,27 @@ class TestMediaRetryManager(unittest.TestCase):
         self.assertNotEqual(placeholder_uid, "None")
         self.assertTrue(placeholder_uid.isdigit())
 
+    def test_empty_source_with_message_id_retries_via_get_cdn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir) / "document.pdf")
+            Path(path).write_bytes(b"document")
+            retry_id = self.create("", media_type="file", msgid=321)
+            self.channel.GetMsgCdn = Mock(return_value=path)
+
+            with patch(
+                "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+                return_value=FakeMessage(),
+            ), patch.object(
+                self.manager,
+                "_build_context",
+                return_value=(self.chat, self.author),
+            ):
+                result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "媒体重试发送成功")
+        self.channel.GetMsgCdn.assert_called_once_with(321)
+        self.assertNotIn(retry_id, self.channel.db.rows)
+
     def test_failed_placeholder_send_discards_unreachable_retry(self):
         self.channel.send_efb_msgs = Mock(side_effect=RuntimeError("downstream failed"))
 
@@ -249,7 +273,7 @@ class TestMediaRetryManager(unittest.TestCase):
             ):
                 result = self.manager.retry(retry_id)
 
-        self.assertEqual(result, "媒体重试失败，请稍后再试")
+        self.assertEqual(result, "视频重试失败，请稍后再试")
         self.assertIn(retry_id, self.channel.db.rows)
 
     def test_concurrent_manual_retry_restores_command_without_running_twice(self):
@@ -399,6 +423,28 @@ class TestMediaRetryManager(unittest.TestCase):
 
         self.assertNotIn(retry_id, self.channel.db.rows)
 
+    def test_recalled_video_edits_placeholder_without_retry_and_consumes_token(self):
+        retry_id = self.create("/missing/video.mp4")
+        self.channel.GetMsgCdn = Mock(
+            side_effect=MediaPermanentlyUnavailable("message recalled")
+        )
+
+        with patch(
+            "efb_wechat_comwechat_slave.media_retry.MsgProcess",
+            return_value=FakeMessage(),
+        ), patch.object(
+            self.manager,
+            "_build_context",
+            return_value=(self.chat, self.author),
+        ):
+            result = self.manager.retry(retry_id)
+
+        self.assertEqual(result, "视频已被撤回，无法重试，请在手机端查看。")
+        self.assertNotIn(retry_id, self.channel.db.rows)
+        messages, kwargs = self.channel.sent[0]
+        self.assertTrue(kwargs["edit"])
+        self.assertIsNone(messages[0].commands)
+
     def test_exhausted_retry_is_not_downloaded_and_keeps_token(self):
         retry_id = self.create("/missing/video.mp4")
         self.channel.db.rows[retry_id]["_auto_retry"] = {
@@ -520,6 +566,25 @@ class TestMediaRetryManager(unittest.TestCase):
             self.channel.db.rows[retry_id]["_auto_retry"],
             {"attempts": 1, "next_at": 320},
         )
+
+    def test_temporary_failure_names_the_media_type(self):
+        for media_type, expected in (
+            ("image", "图片重新下载失败，请稍后再试"),
+            ("video", "视频重新下载失败，请稍后再试"),
+        ):
+            with self.subTest(media_type=media_type), patch.object(
+                self.manager,
+                "_edit_failure",
+            ) as edit_failure:
+                self.manager._temporary_failure(
+                    "retry-id",
+                    {"type": media_type},
+                )
+
+            edit_failure.assert_called_once()
+            args, kwargs = edit_failure.call_args
+            self.assertEqual(args, ({"type": media_type}, expected))
+            self.assertEqual(kwargs["command"].kwargs["retry_id"], "retry-id")
 
     def test_manual_failure_does_not_restart_exhausted_schedule(self):
         retry_id = self.create("/missing/video.mp4")

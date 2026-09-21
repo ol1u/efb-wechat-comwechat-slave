@@ -50,6 +50,7 @@ from .media_retry import (
     MEDIA_DELETE_TYPES,
     MEDIA_RETRY_TYPES,
     MEDIA_WAIT_SECONDS,
+    MediaPermanentlyUnavailable,
     MediaRetryManager,
 )
 
@@ -776,6 +777,14 @@ class ComWeChatChannel(SlaveChannel):
                 msgid,
             )
             return None
+
+        if (
+            isinstance(response, dict)
+            and response.get("error_code") == "message_recalled"
+        ):
+            raise MediaPermanentlyUnavailable(
+                response.get("err_msg") or "message recalled"
+            )
 
         raw_path = response.get("path") if isinstance(response, dict) else None
         if not isinstance(raw_path, str) or not raw_path:

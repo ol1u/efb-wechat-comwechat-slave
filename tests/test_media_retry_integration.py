@@ -6,7 +6,11 @@ import unittest
 from unittest.mock import Mock, patch
 
 from efb_wechat_comwechat_slave.ComWechat import ComWeChatChannel
-from efb_wechat_comwechat_slave.media_retry import MEDIA_WAIT_SECONDS, MediaRetryManager
+from efb_wechat_comwechat_slave.media_retry import (
+    MEDIA_WAIT_SECONDS,
+    MediaPermanentlyUnavailable,
+    MediaRetryManager,
+)
 from ehforwarderbot.message import Message
 
 
@@ -142,6 +146,24 @@ class TestMediaRetryIntegration(unittest.TestCase):
 
         self.assertEqual(path, "/mnt/wechat/wxid/FileStorage/Video/a.mp4")
         channel.bot.GetCdn.assert_called_once_with(msgid=789)
+
+    def test_get_msg_cdn_raises_permanent_error_for_recalled_message(self):
+        channel = types.SimpleNamespace(
+            bot=types.SimpleNamespace(
+                GetCdn=Mock(return_value={
+                    "result": "ERROR",
+                    "error_code": "message_recalled",
+                    "err_msg": "message recalled",
+                }),
+            ),
+            logger=logging.getLogger("test-media-retry"),
+        )
+
+        with self.assertRaisesRegex(
+            MediaPermanentlyUnavailable,
+            "message recalled",
+        ):
+            ComWeChatChannel.GetMsgCdn(channel, 789)
 
     def test_retry_media_delegates_to_manager(self):
         manager = types.SimpleNamespace(retry=Mock(return_value="done"))

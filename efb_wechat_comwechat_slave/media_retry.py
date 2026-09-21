@@ -48,6 +48,10 @@ AUTO_RETRY_IDLE_SECONDS = 1
 AUTO_RETRY_STATE_KEY = "_auto_retry"
 
 
+class MediaPermanentlyUnavailable(RuntimeError):
+    pass
+
+
 class MediaRetryManager:
     def __init__(self, channel: Any) -> None:
         self.channel = channel
@@ -63,7 +67,14 @@ class MediaRetryManager:
             if msg.get("type") == "animatedsticker"
             else path
         )
-        if not source and msg.get("type") != "animatedsticker":
+        has_message_reference = any(
+            msg.get(key) not in (None, "") for key in ("msgid", "svrid")
+        )
+        if (
+            not source
+            and msg.get("type") != "animatedsticker"
+            and not has_message_reference
+        ):
             raise ValueError("media retry source is missing")
         retry_msg = {key: msg[key] for key in MEDIA_RETRY_FIELDS if key in msg}
         retry_msg["type"] = msg.get("type")
@@ -177,15 +188,22 @@ class MediaRetryManager:
         source = media.get("source")
         media_type = media.get("type")
         placeholder_uid = media.get("placeholder_uid")
+        msg = dict(media.get("msg") or {})
+        has_message_reference = any(
+            msg.get(key) not in (None, "") for key in ("msgid", "svrid")
+        )
         if (
             media_type not in MEDIA_RETRY_TYPES
             or not placeholder_uid
-            or (media_type != "animatedsticker" and not source)
+            or (
+                media_type != "animatedsticker"
+                and not source
+                and not has_message_reference
+            )
         ):
             return "不支持重试此媒体"
 
         try:
-            msg = dict(media.get("msg") or {})
             conversion_type = media_type
             if media_type == "animatedsticker" or (
                 media_type == "share" and is_sticker_share(msg)
@@ -244,6 +262,13 @@ class MediaRetryManager:
                     chat=chat,
                     uid=MessageID(f"{placeholder_uid}-retry-{time.time_ns()}"),
                 )
+        except MediaPermanentlyUnavailable:
+            self.channel.logger.info(
+                "Media retry is permanently unavailable: type=%s token=%s",
+                media_type,
+                retry_id,
+            )
+            return self._permanent_media_failure(retry_id, media)
         except StickerPermanentError:
             self.channel.logger.info(
                 "Animated sticker retry is permanently unavailable: token=%s",
@@ -421,6 +446,20 @@ class MediaRetryManager:
         except Exception:
             self.channel.logger.exception(
                 "Failed to edit permanently unavailable sticker placeholder: token=%s",
+                retry_id,
+            )
+        finally:
+            self.channel.db.delete_media_retry(retry_id)
+        return text
+
+    def _permanent_media_failure(self, retry_id, media):
+        media_name = MEDIA_TYPE_NAMES.get(media.get("type"), "媒体")
+        text = f"{media_name}已被撤回，无法重试，请在手机端查看。"
+        try:
+            self._edit_failure(media, text)
+        except Exception:
+            self.channel.logger.exception(
+                "Failed to edit recalled media placeholder: token=%s",
                 retry_id,
             )
         finally:
