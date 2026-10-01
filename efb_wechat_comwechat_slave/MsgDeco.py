@@ -1,4 +1,4 @@
-from typing import Callable, Mapping, Tuple, List, Union, IO
+from typing import Mapping, Tuple, List, Union, IO
 import magic
 from lxml import etree
 from functools import partial
@@ -60,34 +60,16 @@ def parse_chat_history(xml, level: int = 1) -> list[dict]:
                 data['placeholder'] = '[Video]'
             elif data['datatype'] == '5':
                 data['placeholder'] = f"[Link] {data['datatitle']}"
-            elif data['datatype'] == '6':
-                poiname = _item_text(dataitem, 'poiname')
-                label = _item_text(dataitem, 'label')
-                location_name = poiname or label or data['datadesc']
-                data['placeholder'] = f"[Location] {location_name}".strip()
             elif data['datatype'] == '8':
-                file_title = data['datatitle'] or data['datafmt'] or dataitem.get('dataid', '')
-                if dataitem.get('htmlid') == 'WeNoteHtmlFile':
-                    data['placeholder'] = f"[Note] {file_title}".strip()
-                else:
-                    data['placeholder'] = f"[File] {file_title}".strip()
+                data['placeholder'] = f"[File] {data['datatitle']}"
             elif data['datatype'] == '17':
                 data['placeholder'] = f"\n{' ' * count}[Chat History]"
                 for i in parse_chat_history(dataitem.find('recordxml/recordinfo'), level + 1):
                     data['placeholder'] += f"\n{' ' * count}{i['formatted']}"
-                    data['children'].append(i)
+                    data['children'] = i
                 data['placeholder'] += f"\n{' ' * count}[Chat History]"
             elif data['datatype'] == '19':
                 data['placeholder'] = f"[Mini Program] {data['datatitle']}"
-            elif data['datatype'] == '22':
-                finder_nickname = _item_text(dataitem, 'nickname')
-                finder_desc = _item_text(dataitem, 'desc') or data['datadesc']
-                media_count = _item_text(dataitem, 'mediaCount')
-                finder_title = data['datatitle'] or finder_desc or finder_nickname
-                if media_count:
-                    data['placeholder'] = f"[Finder] {finder_title} ({media_count} media)".strip()
-                else:
-                    data['placeholder'] = f"[Finder] {finder_title}".strip()
             else:
                 data['placeholder'] = data['datadesc'] or data['datatitle']
 
@@ -225,11 +207,7 @@ def efb_mp_post_wrapper(item: etree.Element, show_name: str = None) -> Message:
         text=f'{title}\n  - - - - - - - - - - - - - - - \n{digest}' if digest else str(title),
     )
 
-def efb_share_link_wrapper(
-    message: dict,
-    chat,
-    message_reference_resolver: Callable[[MessageID], List[MessageID]] = None,
-) -> Message:
+def efb_share_link_wrapper(message: dict, chat) -> Message:
     """
     处理msgType49消息 - 复合xml, xml 中 //appmsg/type 指示具体消息类型.
     /msg/appmsg/type
@@ -296,65 +274,27 @@ def efb_share_link_wrapper(
                 )
             except:
                 pass
-        elif type in [ 4 , 36 ]: # 至少包含小红书分享 , 京东农场 , 滴滴打车 / 部分卡片无 url
-            title = xml.xpath('string(/msg/appmsg/title)')
-            des = xml.xpath('string(/msg/appmsg/des)')
-            url = xml.xpath('string(/msg/appmsg/url)')
-            app = xml.xpath('string(/msg/appinfo/appname)') or xml.xpath('string(/msg/appmsg/sourcedisplayname)')
-            pagepath = xml.xpath('string(/msg/appmsg/weappinfo/pagepath)')
-            commands = []
-            vendor_specific = { "is_mp": False }
-            if not url:
-                source_display = xml.xpath('string(/msg/appmsg/sourcedisplayname)') or ""
-                has_stock_pagepath = isinstance(pagepath, str) and ("pages/quote/quote.html?s=" in pagepath)
-                has_stock_code_in_title = bool(re.search(r"\(\d{6}\)", title or ""))
-                weapp_appid = xml.xpath('string(/msg/appmsg/weappinfo/appid)') or ""
-                is_stock_card = (
-                    type == 36 and (
-                        app == "腾讯微证券"
-                        or "腾讯微证券" in source_display
-                        or weapp_appid == "wx4eff699c2e813ab6"
-                    ) and (
-                        has_stock_pagepath
-                        or has_stock_code_in_title
-                    )
-                )
-
-                if is_stock_card:
-                    app = "腾讯微证券"
-                    stock_urls = _build_stock_urls(title=title, pagepath=pagepath)
-                    if stock_urls:
-                        url = stock_urls["ths"]
-                        commands = [
-                            MessageCommand(
-                                name="东方财富",
-                                callable_name="open_external_link",
-                                kwargs={"url": stock_urls["eastmoney"]},
-                            ),
-                            MessageCommand(
-                                name="同花顺",
-                                callable_name="open_external_link",
-                                kwargs={"url": stock_urls["ths"]},
-                            ),
-                        ]
-                        vendor_specific["stock_market"] = stock_urls["market"]
-                        vendor_specific["stock_code"] = stock_urls["code"]
-
-            description = f"{des}\n---- from {app}" if des else f"---- from {app}"
+        elif type in [ 4 , 36 ]: # 至少包含小红书分享 , 京东农场 , 滴滴打车
+            title = xml.xpath('/msg/appmsg/title/text()')[0]
+            try:
+                des = xml.xpath('/msg/appmsg/des/text()')[0]
+            except:
+                des = ""
+            url = xml.xpath('/msg/appmsg/url/text()')[0]
+            app = xml.xpath('/msg/appinfo/appname/text()')[0]
+            description = f"{des}\n---- from {app}"
             attribute = LinkAttribute(
                 title = title,
                 description = description,
-                url = url,
+                url = url ,
                 image = None
             )
             efb_msg = Message(
                 attributes=attribute,
                 type=MsgType.Link,
-                text=None,
-                vendor_specific = vendor_specific,
+                text= None,
+                vendor_specific={ "is_mp": False }
             )
-            if commands:
-                efb_msg.commands = MessageCommands(commands)
         elif type == 5: # xml链接
             if len(xml.xpath('/msg/appmsg/showtype/text()'))!=0:
                 showtype = int(xml.xpath('/msg/appmsg/showtype/text()')[0])
@@ -387,7 +327,7 @@ def efb_share_link_wrapper(
                             result_text += f"\n转发自公众号[{sourcedisplayname}(id: {sourceusername})]\n\n"
                         except:
                             result_text += f"\n转发自公众号[{sourcedisplayname}]\n\n"
-                except Exception:
+                except Exception as e:
                     print_exc()
                 if title is not None and url is not None:
                     attribute = LinkAttribute(
@@ -406,21 +346,6 @@ def efb_share_link_wrapper(
                 items = xml.xpath('//item')
                 show_name = xml.xpath('//publisher/nickname/text()')[0] if '@app' in text else ''
                 efb_msg = list(map(partial(efb_mp_post_wrapper, show_name=show_name), items))
-        elif type == 6: # 文件分享消息
-            title = xml.xpath('string(/msg/appmsg/title)')
-            fileext = xml.xpath('string(/msg/appmsg/appattach/fileext)')
-            size = xml.xpath('string(/msg/appmsg/appattach/totallen)')
-            detail = title or '文件'
-            if fileext:
-                detail = f"{detail} ({fileext})"
-            if size and size.isdigit():
-                size_kb = round(int(size) / 1024, 1)
-                detail = f"{detail} - {size_kb} KB"
-            efb_msg = Message(
-                type=MsgType.Text,
-                text=f"[文件] {detail}",
-                vendor_specific={ "is_mp": False }
-            )
         elif type == 8:
             efb_msg = Message(
                 type=MsgType.Unsupported,
@@ -445,7 +370,7 @@ def efb_share_link_wrapper(
                 for data in parse_chat_history(recordinfo_root):
                     texts.append(data['formatted'])
                 forward_content = "\n".join(texts)
-            except Exception:
+            except Exception as e:
                 forward_content = xml.xpath('/msg/appmsg/des/text()')[0]
 
             result_text += f"{msg_title}\n\n{forward_content}"
@@ -512,15 +437,6 @@ def efb_share_link_wrapper(
                 text= f"{title}\n\n{desc}" ,
                 vendor_specific={ "is_forwarded": True }
             )
-        elif type == 50: # 当前版本不支持展示的卡片
-            title = xml.xpath('string(/msg/appmsg/title)') or "当前版本不支持展示该内容"
-            url = xml.xpath('string(/msg/appmsg/url)')
-            text = title if not url else f"{title}\n{url}"
-            efb_msg = Message(
-                type=MsgType.Text,
-                text=text,
-                vendor_specific={ "is_mp": True }
-            )
         elif type == 51: # 视频（微信视频号分享）
             title = xml.xpath('/msg/appmsg/title/text()')[0]
             url = xml.xpath('/msg/appmsg/url/text()')[0]
@@ -562,66 +478,39 @@ def efb_share_link_wrapper(
                 vendor_specific={ "is_refer": True }
             )
             prefix = ""
-            recorded_reference = None
+            sent_by_master = True
             if refer_svrid is not None:
-                references = [MessageID(refer_svrid)]
-                if callable(message_reference_resolver):
-                    try:
-                        resolved_references = message_reference_resolver(MessageID(refer_svrid))
-                    except Exception:
-                        print_exc()
-                    else:
-                        if resolved_references:
-                            references = [MessageID(str(reference)) for reference in resolved_references]
-                            if MessageID(refer_svrid) not in references:
-                                references.insert(0, MessageID(refer_svrid))
                 try:
-                    if "@chatroom" in (refer_fromusr or ""):  # 群聊中回复的消息
-                        c = ChatMgr.build_efb_chat_as_group(EFBGroupChat(
-                            uid = message["sender"],
-                        ))
-                    else:
-                        c = ChatMgr.build_efb_chat_as_private(EFBPrivateChat(
-                            uid = message["sender"],
-                        ))
-                    for reference in references:
-                        try:
-                            if coordinator.master.get_message_by_id(chat=c, msg_id=reference) is not None:
-                                recorded_reference = reference
-                                break
-                        except NotImplementedError:
-                            print_exc()
-                            break
-                        except Exception:
-                            print_exc()
-                except Exception:
-                    print_exc()
+                    # 从 master channel 中根据微信 id 查找，如果找到说明是由 comwechat self_msg 发送过去的
+                    master_message = coordinator.master.get_message_by_id(chat=chat, msg_id=refer_svrid)
+                    if master_message is not None:
+                        sent_by_master = False
+                except:
+                    pass
             if refer_displayname is not None:
                 prefix = f"{refer_displayname}:"
-            if refer_svrid is None or recorded_reference is None:
-                #因为微信会将视频/文件等拆分成多条消息，refer_svrid 对应的可能是 slave_message_id 的一部分
-                try:
-                    if refer_msgType == 1: # 被引用的消息是文本
-                        refer_content = xml.xpath('/msg/appmsg/refermsg/content/text()')[0] # 被引用消息内容
-                        result_text = qutoed_text(refer_content, msg, prefix)
-                    elif refer_msgType == 49: # 被引用的消息也是引用消息
-                            refer_msg_content = xml.xpath('/msg/appmsg/refermsg/content/text()')[0] # 被引用消息引用的消息
-                            refer_msg_xml = etree.fromstring(refer_msg_content)
-                            type = int(refer_msg_xml.xpath('/msg/appmsg/type/text()')[0])
-                            if type == 57:
-                                refer_msg_text = refer_msg_xml.xpath('/msg/appmsg/title/text()')[0]
-                                result_text = qutoed_text(refer_msg_text, msg, prefix)
-                            else:
-                                result_text = msg
-                    else: # 被引用的消息非文本，提示不支持
-                        result_text = qutoed_text(" 系统消息: 被引用的消息不是文本,暂不支持展示", msg, prefix)
-                except Exception as e:
-                    print_exc()
-                finally:
-                    efb_msg.text = result_text
+            if refer_svrid is None or (refer_chatusr == message["self"] and sent_by_master):
+                if refer_msgType == 1: # 被引用的消息是文本
+                    refer_content = xml.xpath('/msg/appmsg/refermsg/content/text()')[0] # 被引用消息内容
+                    result_text = qutoed_text(refer_content, msg, prefix)
+                elif refer_msgType == 49: # 被引用的消息也是引用消息
+                    try:
+                        refer_msg_content = xml.xpath('/msg/appmsg/refermsg/content/text()')[0] # 被引用消息引用的消息
+                        refer_msg_xml = etree.fromstring(refer_msg_content)
+                        type = int(refer_msg_xml.xpath('/msg/appmsg/type/text()')[0])
+                        if type == 57:
+                            refer_msg_text = refer_msg_xml.xpath('/msg/appmsg/title/text()')[0]
+                            result_text = qutoed_text(refer_msg_text, msg, prefix)
+                        else:
+                            result_text = msg
+                    except Exception as e:
+                        print_exc()
+                else: # 被引用的消息非文本，提示不支持
+                    result_text = qutoed_text(" 系统消息: 被引用的消息不是文本,暂不支持展示", msg, prefix)
+                efb_msg.text = result_text
             else:
                 efb_msg.target = Message(
-                    uid=MessageID(str(recorded_reference)),
+                    uid=MessageID(refer_svrid),
                     chat=chat,
                 )
         elif type == 63: # 直播（微信视频号分享）
@@ -671,7 +560,7 @@ def efb_share_link_wrapper(
                     text= f"退还微信转账 {money} 元",
                     vendor_specific={ "is_mp": False }
                 )
-    except Exception:
+    except Exception as e:
         print_exc()
 
     try:

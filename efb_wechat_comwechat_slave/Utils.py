@@ -1,20 +1,14 @@
 import logging
-import re
 import tempfile
-from ehforwarderbot.types import MessageID
+import threading
 import requests as requests
+import re
+import json
 import yaml
-from typing import Dict , Any, IO, Optional
+from typing import Dict , Any
 import pilk
 import pydub
 import os
-
-VOICE_OGG_EXPORT_KWARGS = {
-    "format": "ogg",
-    "codec": "libopus",
-    "parameters": ['-vbr', 'on'],
-}
-MEDIA_WAIT_SECONDS = 5
 
 #从本地读取配置
 def load_config(path : str) -> Dict[str, None]:
@@ -31,19 +25,18 @@ def load_config(path : str) -> Dict[str, None]:
         config: Dict[str, Any] = d
     return config
 
-def download_file(url: str, retry: int = 3, timeout: int = 10) -> tempfile:
+def download_file(url: str, retry: int = 3) -> tempfile:
     """
     A function that downloads files from given URL
     Remember to close the file once you are done with the file!
     :param retry: The max retries before giving up
-    :param timeout: The HTTP request timeout in seconds
     :param url: The URL that points to the file
     """
     count = 1
     while True:
         try:
             file = tempfile.NamedTemporaryFile()
-            r = requests.get(url, stream=True, timeout=timeout)
+            r = requests.get(url, stream=True, timeout=10)
             for chunk in r.iter_content(chunk_size=1024):
                 if chunk:
                     file.write(chunk)
@@ -61,16 +54,15 @@ def download_file(url: str, retry: int = 3, timeout: int = 10) -> tempfile:
 def wechatimagedecode( file : str) -> tempfile:
     """
     代码来源 https://github.com/zhangxiaoyang/WechatImageDecoder
-    图片消息优先读取 ImageHook 已解码文件，缺失时回退 dat 解码。
+
+    解码微信 XOR 混淆后的图片。相比原版更健壮:
+    - 文件不存在/为空时抛 ValueError(调用方可捕获并降级),而不是崩溃
+    - 若文件本身已是明文图片(jpg/png/gif),直接拷贝不做 XOR
+    - 无法识别编码时抛 ValueError(多为文件尚未下载完整),而不是 TypeError
     """
-    decoded_file = resolve_hooked_wechat_image_path(file)
-    if decoded_file:
-        print(f"123 {decoded_file}", flush=True)
-        return open(decoded_file, "rb")
-    print(456, flush=True)
     def do_magic(header_code, buf):
         return header_code ^ list(buf)[0] if buf else 0x00
-    
+
     def decode(magic, buf):
         return bytearray([b ^ magic for b in list(buf)])
 
@@ -81,103 +73,52 @@ def wechatimagedecode( file : str) -> tempfile:
             'gif': (0x47, 0x49),
         }
         for encoding in headers:
-            header_code, check_code = headers[encoding] 
+            header_code, check_code = headers[encoding]
             magic = do_magic(header_code, buf)
             _, code = decode(magic, buf[:2])
             if check_code == code:
                 return (encoding, magic)
         return None
 
+    def is_plain_image(buf):
+        return (
+            bytes(buf[:2]) == b'\xff\xd8' or    # jpg
+            bytes(buf[:4]) == b'\x89PNG' or     # png
+            bytes(buf[:3]) == b'GIF'            # gif87a / gif89a
+        )
+
+    if not os.path.isfile(file):
+        raise ValueError("图片文件不存在: %s" % file)
     with open(file , 'rb') as f:
         buf = bytearray(f.read())
-    file_type, magic = guess_encoding(buf)
-    file_type = file_type or "jpg"
+    if not buf:
+        raise ValueError("图片文件为空: %s" % file)
 
-    ret_file = tempfile.NamedTemporaryFile(suffix=f".{file_type}")
+    ret_file = tempfile.NamedTemporaryFile()
+    if is_plain_image(buf):
+        # 文件本身已是明文图片,直接拷贝
+        with open(ret_file.name , 'wb') as f:
+            f.write(buf)
+        return ret_file
+
+    guessed = guess_encoding(buf)
+    if guessed is None:
+        raise ValueError("无法识别图片编码(文件可能尚未下载完整): %s" % file)
+    file_type, magic = guessed
+
     with open(ret_file.name , 'wb') as f:
         f.write(decode(magic, buf))
-    f.close()
     return ret_file
-
-def detect_image_suffix(file: str) -> str:
-    with open(file, "rb") as source:
-        header = source.read(16)
-    if header.startswith((b"GIF87a", b"GIF89a")):
-        return ".gif"
-    if header.startswith(b"\xff\xd8\xff"):
-        return ".jpg"
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return ".png"
-    if header.startswith(b"RIFF") and header[8:12] == b"WEBP":
-        return ".webp"
-    return ""
-
 
 def load_local_file_to_temp(file : str) -> tempfile:
     """
     从本地文件读取文件到临时文件
     """
-    suffix = detect_image_suffix(file) or os.path.splitext(file)[1]
-    ret_file = tempfile.NamedTemporaryFile(suffix=suffix)
+    ret_file = tempfile.NamedTemporaryFile()
     with open(file , 'rb') as f:
         ret_file.write(f.read())
-    ret_file.flush()
-    ret_file.seek(0)
+    f.close()
     return ret_file
-
-def load_local_file_for_transfer(file: str, direct_transfer: bool = False) -> IO[bytes]:
-    """
-    根据 direct_transfer 选择本地直传或临时文件传输。
-    """
-    if direct_transfer:
-        return open(file, "rb")
-    return load_local_file_to_temp(file)
-
-IMAGE_HOOK_EXTENSIONS = (".jpg", ".png", ".gif")
-
-def extract_sticker_url(msg: Dict[str, Any]) -> Optional[str]:
-    message = msg.get("message") or ""
-    match = re.search(r'cdnurl\s*=\s*["\']([^"\']+)', message)
-    if match:
-        return match.group(1).replace("amp;", "")
-    url = msg.get("url")
-    return url if isinstance(url, str) and url else None
-
-def resolve_hooked_wechat_image_path(file: str) -> Optional[str]:
-    """
-    从微信 dat 路径推导 ImageHook 已解码后的图片路径。
-    """
-    if not file:
-        return None
-
-    normalized_file = file.replace("\\", "/")
-    basename = os.path.basename(normalized_file)
-    stem, suffix = os.path.splitext(basename)
-    suffix = suffix.lower()
-
-    if not stem:
-        return None
-
-    if suffix in IMAGE_HOOK_EXTENSIONS and os.path.exists(normalized_file):
-        return normalized_file
-
-    candidate_dirs = []
-    if "/FileStorage/" in normalized_file:
-        candidate_dirs.append(normalized_file.split("/FileStorage/", 1)[0])
-
-    if suffix in IMAGE_HOOK_EXTENSIONS:
-        candidate_dirs.append(os.path.dirname(normalized_file))
-
-    checked_dirs = set()
-    for folder in candidate_dirs:
-        if not folder or folder in checked_dirs:
-            continue
-        checked_dirs.add(folder)
-        for ext in IMAGE_HOOK_EXTENSIONS:
-            candidate = os.path.join(folder, f"{stem}{ext}")
-            if os.path.exists(candidate):
-                return candidate
-    return None
 
 def load_temp_file_to_local(file : tempfile , path : str) -> None:
     """
@@ -189,57 +130,20 @@ def load_temp_file_to_local(file : tempfile , path : str) -> None:
 
 def convert_silk_to_mp3(file : tempfile) -> tempfile:
     """
-    将微信语音统一转换为 OGG 文件。
+    将silk文件转换为mp3文件
     """
-    f = tempfile.NamedTemporaryFile(suffix=".ogg")
+    f = tempfile.NamedTemporaryFile()
     file.seek(0)
     silk_header = file.read(10)
     file.seek(0)
-
     if b"#!SILK_V3" in silk_header:
-        pcm_file = tempfile.NamedTemporaryFile()
-        pilk.decode(file.name, pcm_file.name)
+        pilk.decode(file.name, f.name)
         file.close()
-        pydub.AudioSegment.from_raw(
-            file=pcm_file,
-            sample_width=2,
-            frame_rate=24000,
-            channels=1,
-        ).export(f.name, **VOICE_OGG_EXPORT_KWARGS)
-        pcm_file.close()
-    elif silk_header.startswith((b"#!AMR\n", b"#!AMR-WB\n")):
-        pydub.AudioSegment.from_file(file.name, format="amr").export(
-            f.name,
-            **VOICE_OGG_EXPORT_KWARGS,
-        )
-    else:
-        pydub.AudioSegment.from_file(file.name).export(
-            f.name,
-            **VOICE_OGG_EXPORT_KWARGS,
-        )
-
-    f.seek(0)
+        pydub.AudioSegment.from_raw(file= f , sample_width=2, frame_rate=24000, channels=1) \
+            .export( f , format="ogg", codec="libopus",
+                    parameters=['-vbr', 'on'])
     return f
 
-def dump_message_ids(ids: list[MessageID]) -> MessageID:
-    return MessageID(",".join(ids))
-
-def load_message_ids(id: MessageID) -> list[MessageID]:
-    return [MessageID(item) for item in str(id).split(",") if item]
-
-def is_message_reference(value: MessageID) -> bool:
-    reference = str(value)
-    if reference.isdecimal():
-        return int(reference) > 0
-    parts = reference.split(":")
-    return (
-        len(parts) == 3
-        and parts[0] == "local"
-        and parts[1].isdecimal()
-        and int(parts[1]) > 0
-        and parts[2].isdecimal()
-        and int(parts[2]) > 0
-    )
 
 WC_EMOTICON_CONVERSION = {
     '[微笑]': '😃', '[Smile]': '😃',
@@ -254,7 +158,7 @@ WC_EMOTICON_CONVERSION = {
     '[大哭]': '😣', '[Cry]': '😣',
     '[尴尬]': '😰', '[Awkward]': '😰',
     '[发怒]': '😡', '[Pout]': '😡',
-    '[调皮]': '😜', '[Wink]': '😜', '[Tongue]': '😜',
+    '[调皮]': '😜', '[Wink]': '😜',
     '[呲牙]': '😁', '[Grin]': '😁',
     '[惊讶]': '😱', '[Surprised]': '😱',
     '[难过]': '🙁', '[Frown]': '🙁',
@@ -278,7 +182,7 @@ WC_EMOTICON_CONVERSION = {
     '[衰]': '😳', '[BadLuck]': '😳',
     '[骷髅]': '💀', '[Skull]': '💀',
     '[敲打]': '👊', '[Hammer]': '👊',
-    '[再见]': '🙋\u200d♂', '[Bye]': '🙋\u200d♂', '[Wave]': '🙋\u200d♂',
+    '[再见]': '🙋\u200d♂', '[Bye]': '🙋\u200d♂',
     '[擦汗]': '😥', '[Relief]': '😥',
     '[抠鼻]': '🤷\u200d♂', '[DigNose]': '🤷\u200d♂',
     '[鼓掌]': '👏', '[Clap]': '👏',
@@ -288,7 +192,7 @@ WC_EMOTICON_CONVERSION = {
     '[哈欠]': '😪', '[Yawn]': '😪',
     '[鄙视]': '😒', '[Lookdown]': '😒',
     '[委屈]': '😣', '[Wronged]': '😣',
-    '[快哭了]': '😔', '[Puling]': '😔', '[LetDown]': '😔', 
+    '[快哭了]': '😔', '[Puling]': '😔',
     '[阴险]': '😈', '[Sly]': '😈',
     '[亲亲]': '😘', '[Kiss]': '😘',
     '[可怜]': '😻', '[Whimper]': '😻',

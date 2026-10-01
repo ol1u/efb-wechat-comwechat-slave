@@ -1,7 +1,9 @@
 # coding: utf-8
+import contextlib
 import logging
-from typing import Optional, List
+from typing import Dict, Optional, List
 
+from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.chat import GroupChat, PrivateChat, ChatMember, SystemChat
 
 from .CustomTypes import EFBGroupChat, EFBGroupMember, EFBPrivateChat, EFBSystemUser
@@ -55,24 +57,15 @@ class ChatMgr:
         :param member: EFBGroupMember object, see CustomTypes.py
         :return: Newly built ChatMember
         """
-        try:
+        with contextlib.suppress(KeyError):
             m = chat.get_member(str(member.get('uid', '')))
-        except KeyError:
-            m: ChatMember = chat.add_member(
-                **member
-            )
-        name = member.get('name')
-        alias = member.get('alias')
-        if isinstance(name, str) and name.startswith('wxid_') and alias:
-            m.name = alias
-            m.alias = None
-        else:
-            if name is not None:
-                m.name = name
-            if alias is not None:
-                m.alias = alias
-        if m.alias == m.name:
-            m.alias = None
+        m: ChatMember = chat.add_member(
+            **member
+        )
+        if member.get('name', None) is not None:
+            m.name = member.get('name')
+        if member.get('alias', None) is not None:
+            m.alias = member.get('alias')
         return m
 
     @staticmethod

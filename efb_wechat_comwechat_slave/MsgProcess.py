@@ -1,17 +1,30 @@
 from typing import Union, List
+import base64
+import tempfile
+import logging
 from .Utils import *
 from .MsgDeco import *
 import re
+import pydub
+import json
+from lxml import etree
 
+from ehforwarderbot import utils as efb_utils
 from ehforwarderbot.message import Message
 
-def MsgProcess(
-    msg: dict,
-    chat,
-    direct_transfer: bool = False,
-    message_reference_resolver=None,
-    animated_sticker_resolver=None,
-) -> Union[Message, List[Message]]:
+def MsgWrapper(msg, efb_msgs:  Union[Message, List[Message]]):
+    efb_msgs = [efb_msgs] if isinstance(efb_msgs, Message) else efb_msgs
+    if not efb_msgs:
+        return
+    for efb_msg in efb_msgs:
+        vendor_specific = getattr(efb_msg, "vendor_specific", {})
+        xml = msg.pop("message", None)
+        vendor_specific["wx_xml"] = xml
+        vendor_specific["comwechat_info"] = msg
+        setattr(efb_msg, "vendor_specific", vendor_specific)
+    return efb_msgs
+
+def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
 
     if msg["type"] == "text":
         at_list = {}
@@ -42,38 +55,25 @@ def MsgProcess(
         return efb_image_wrapper(file)
 
     elif msg["type"] == "animatedsticker":
-        if animated_sticker_resolver is not None:
-            path = animated_sticker_resolver(msg)
-            file = load_local_file_to_temp(path)
-        else:
-            path = msg.get("filepath")
-            if path and os.path.isfile(path):
-                file = load_local_file_to_temp(path)
-            else:
-                url = extract_sticker_url(msg)
-                if not url:
-                    raise ValueError("animated sticker URL is missing")
-                file = download_file(url, retry=1, timeout=MEDIA_WAIT_SECONDS)
-        return efb_image_wrapper(file)
+        try:
+            url = re.search("cdnurl\s*=\s*\"(.*?)\"", msg["message"]).group(1).replace("amp;", "")
+            file = download_file(url)
+            return efb_image_wrapper(file)
+        except:
+            return efb_text_simple_wrapper("Image received and download failed. Please check it on your phone.")
 
     elif msg["type"] == "share":
-        if msg.get("filepath") and os.path.exists(msg["filepath"]) and ("Cache" not in msg["filepath"]):
-            file = load_local_file_for_transfer(msg["filepath"], direct_transfer)
+        if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
+            file = load_local_file_to_temp(msg["filepath"])
             return efb_file_wrapper(file, os.path.basename(msg["filepath"]))
-        if message_reference_resolver is None:
-            return efb_share_link_wrapper(msg, chat)  # may return msgs in a list
-        return efb_share_link_wrapper(msg, chat, message_reference_resolver)  # may return msgs in a list
-
-    elif msg["type"] == "file":
-        file = load_local_file_for_transfer(msg["filepath"], direct_transfer)
-        return efb_file_wrapper(file, os.path.basename(msg["filepath"]))
+        return efb_share_link_wrapper(msg, chat)  # may return msgs in a list
 
     elif msg["type"] == "voice":
-        file = convert_silk_to_mp3(load_local_file_for_transfer(msg["filepath"], direct_transfer))
+        file = convert_silk_to_mp3(load_local_file_to_temp(msg["filepath"]))
         return efb_voice_wrapper(file , file.name + ".ogg")
 
     elif msg["type"] == "video":
-        file = load_local_file_for_transfer(msg["filepath"], direct_transfer)
+        file = load_local_file_to_temp(msg["filepath"])
         return efb_video_wrapper(file)
 
     elif msg["type"] == "location":

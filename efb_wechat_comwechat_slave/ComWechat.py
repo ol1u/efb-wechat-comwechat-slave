@@ -6,57 +6,41 @@ from traceback import print_exc
 from pydub import AudioSegment
 import os
 import base64
-import contextlib
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 import re
 import json
-from ehforwarderbot.chat import GroupChat, SystemChatMember, ChatMember
+from ehforwarderbot.chat import SystemChat, PrivateChat , SystemChatMember, ChatMember, SelfChatMember
 import hashlib
-from typing import Optional, Collection, BinaryIO, Dict, Any , Union , List
+from typing import Tuple, Optional, Collection, BinaryIO, Dict, Any , Union , List
+from datetime import datetime
 from cachetools import TTLCache
 
 from ehforwarderbot import MsgType, Chat, Message, Status, coordinator
 from wechatrobot import WeChatRobot
-from wechatrobot import ChatRoomData_pb2 as ChatRoom
 
 from . import __version__ as version
 
 from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.types import MessageID, ChatID, InstanceID
 from ehforwarderbot import utils as efb_utils
-from ehforwarderbot.exceptions import EFBChatNotFound, EFBMessageError, EFBOperationNotSupported
+from ehforwarderbot.exceptions import EFBException, EFBChatNotFound, EFBMessageError
 from ehforwarderbot.message import MessageCommand, MessageCommands
-from ehforwarderbot.status import MessageRemoval, ChatUpdates, MemberUpdates
+from ehforwarderbot.status import MessageRemoval, ChatUpdates
 
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
 from .MsgDeco import qutoed_text
-from .MsgProcess import MsgProcess
-from .animated_sticker import AnimatedStickerCache
-from .Utils import (
-    download_file,
-    load_config,
-    load_temp_file_to_local,
-    resolve_hooked_wechat_image_path,
-    WC_EMOTICON_CONVERSION,
-    dump_message_ids,
-    is_message_reference,
-    load_message_ids,
-)
+from .MsgProcess import MsgProcess, MsgWrapper
+from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION
 from .db import DatabaseManager
-from .dbkey import DbKeyManager
-from .media_retry import (
-    MEDIA_DELETE_TYPES,
-    MEDIA_RETRY_TYPES,
-    MEDIA_WAIT_SECONDS,
-    MediaPermanentlyUnavailable,
-    MediaRetryManager,
-)
+from .Constant import QUOTE_MESSAGE
 
-from typing import Callable
-
-VOICE_DATABASE_NAMES = ("MediaMSG0.db", "MediaMSG1.db", "MediaMSG2.db")
+from rich.console import Console
+from rich import print as rprint
+from io import BytesIO
+from PIL import Image
 
 class ComWeChatChannel(SlaveChannel):
     channel_name : str = "ComWechatChannel"
@@ -65,18 +49,19 @@ class ComWeChatChannel(SlaveChannel):
 
     bot : WeChatRobot = None
     config : Dict = {}
-    delete_media_after_send: bool = True
+
     friends : EFBPrivateChat = []
     groups : EFBGroupChat    = []
 
-    contacts : Dict[str, Dict[str, str]] = {}  # {wxid: {nickname: str, remark: str}}
+    contacts : Dict = {}            # {wxid : {alias : str , remark : str, nickname : str , type : int}} -> {wxid : name(after handle)}
+    nicknames : Dict = {}
     group_members : Dict = {}       # {"group_id" : { "wxID" : "displayName"}}
 
-    time_out : int = int(os.getenv("EFB_MEDIA_TIMEOUT", "300"))
+    time_out : int = 120
     cache =  TTLCache(maxsize=200, ttl= time_out)  # 缓存发送过的消息ID
     file_msg : Dict = {}                           # 存储待修改的文件类消息 {path : msg}
     delete_file : Dict = {}                        # 存储待删除的消息 {path : time}
-    forward_pattern = r"ehforwarderbot:\/\/([^/]+)\/forward\/((?:\d+|local:\d+:\d+))"
+    forward_pattern = r"ehforwarderbot:\/\/([^/]+)\/forward\/(\d+)"
 
     __version__ = version.__version__
     logger: logging.Logger = logging.getLogger("comwechat")
@@ -86,29 +71,16 @@ class ComWeChatChannel(SlaveChannel):
     supported_message_types = {MsgType.Text, MsgType.Sticker, MsgType.Image , MsgType.Link , MsgType.File , MsgType.Video , MsgType.Animation, MsgType.Voice}
     self_update_lock = threading.Lock()
     contact_update_lock = threading.Lock()
+    group_update_lock = threading.Lock()
 
     def __init__(self, instance_id: InstanceID = None):
         super().__init__(instance_id=instance_id)
         self.logger.info("ComWeChat Slave Channel initialized.")
         self.logger.info("Version: %s" % self.__version__)
-        config_path = Path(efb_utils.get_config_path(self.channel_id))
-        self.config = load_config(config_path)
-        self.direct_transfer = "direct_transfer" in self.config
-        self.delete_media_after_send = self.config.get("delete_media_after_send", True) is True
-        self.mark_as_read_enabled = self.config.get("auto_mark_as_read", True) is True
-        try:
-            self.mark_as_read_delay = max(float(self.config.get("mark_as_read_delay", 10)), 0)
-        except (TypeError, ValueError):
-            self.mark_as_read_delay = 10
-        self.mark_as_read_timers: Dict[str, threading.Timer] = {}
-        self.mark_as_read_lock = threading.RLock()
+        self.config = load_config(efb_utils.get_config_path(self.channel_id))
         self.db: DatabaseManager = DatabaseManager(self)
-        self.sticker_cache = AnimatedStickerCache(
-            efb_utils.get_data_path(self.channel_id) / "animated_sticker_cache"
-        )
-        self.media_retries = MediaRetryManager(self)
 
-        # 配置API连接参数 (来自 sddpljx,可在配置文件中自定义 api_host/api_port)
+        # 配置API连接参数
         self.api_host = self.config.get("api_host", "127.0.0.1")
         self.api_port = self.config.get("api_port", 18888)
         self.api_base_url = f"http://{self.api_host}:{self.api_port}"
@@ -116,20 +88,13 @@ class ComWeChatChannel(SlaveChannel):
         # 配置WeChatRobot实例使用自定义host和port
         self.bot = WeChatRobot(ip="0.0.0.0", port=23456, api_host=self.api_host, api_port=self.api_port)
 
-        self.revoke_message_ids = TTLCache(maxsize=200, ttl=max(self.time_out, 1))
-        self._file_locks: Dict[ChatID, threading.Lock] = {}
-        self._file_locks_lock = threading.Lock()
-
         self.wxid = None
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
         self.load()
         self.dir = self.config["dir"]
         if not self.dir.endswith(os.path.sep):
             self.dir += os.path.sep
-        self.dbkey: DbKeyManager = DbKeyManager(self)
-        self._voice_db_names: Optional[List[str]] = None
-
-        # ---- 以下来自 sddpljx: 启动时设置微信版本号 / WSL 路径配置 ----
+        
         try:
             import subprocess
             import json
@@ -210,6 +175,7 @@ class ComWeChatChannel(SlaveChannel):
 
             except Exception as e:
                 self.logger.error(f"设置Windows Hook路径失败: {e}")
+        
         ChatMgr.slave_channel = self
         self.user_auth_chat = ChatMgr.build_efb_chat_as_system_user(EFBSystemUser(
             uid = self.channel_name,
@@ -217,11 +183,12 @@ class ComWeChatChannel(SlaveChannel):
         ))
 
         def update_contacts_wrapper(func):
-            def wrapper(*args, **kwargs):
-                if not self.friends and not self.groups:
-                    self.get_me()
-                    self.GetContactListBySql()
-                return func(*args, **kwargs)
+            def wrapper(msg):
+                if self.wxid is None:
+                    if self.confirm_login():
+                        return func(msg)
+                else:
+                    return func(msg)
             return wrapper
 
         @self.bot.on("self_msg")
@@ -266,12 +233,6 @@ class ComWeChatChannel(SlaveChannel):
                     uid= sender,
                     name= name,
             ))
-            try:
-                self.get_chat(sender)
-            except EFBChatNotFound:
-                self.friends.append(chat)
-                coordinator.send_status(ChatUpdates(channel=self, new_chats=[sender]))
-
             if sender.startswith('gh_'):
                 chat.vendor_specific = {'is_mp' : True}
                 self.logger.debug(f'modified_chat:{chat}')
@@ -293,28 +254,20 @@ class ComWeChatChannel(SlaveChannel):
             ))
 
             try:
-                self.get_chat(sender)
-            except EFBChatNotFound:
-                self.groups.append(chat)
-                coordinator.send_status(ChatUpdates(channel=self, new_chats=[sender]))
-
+                name = self.contacts[wxid]
+            except:
+                name = wxid
             self.extract_alias(msg)
-            member = self.get_group_member(sender, wxid)
+            alias = self.group_members.get(sender,{}).get(wxid , None)
+            if alias == self.nicknames.get(wxid, None):
+                alias = None
 
-            author = ChatMgr.build_efb_chat_as_member(chat, member)
+            author = ChatMgr.build_efb_chat_as_member(chat, EFBGroupMember(
+                uid = wxid,
+                name = name,
+                alias = alias
+            ))
             self.handle_msg(msg, author, chat)
-
-            if msg["type"] == "sysmsg" and msg.get("message", None):
-                match = re.search(r'^(.*?) invited (.*?) to the group chat$', msg["message"])
-                if match:
-                    coordinator.send_status(
-                        MemberUpdates(self, sender, new_members=[ChatID(match.group(2))])
-                    )
-                match = re.search(r'^.*? has deleted this group.$', msg["message"])
-                if match:
-                    coordinator.send_status(
-                        ChatUpdates(self, removed_chats=[sender])
-                    )
 
         @self.bot.on("revoke_msg")
         @update_contacts_wrapper
@@ -344,22 +297,9 @@ class ComWeChatChannel(SlaveChannel):
                     name = name,
                 ))
 
-            newmsgid = MessageID(re.search("<newmsgid>(.*?)<\/newmsgid>", msg["message"]).group(1))
+            newmsgid = re.search("<newmsgid>(.*?)<\/newmsgid>", msg["message"]).group(1)
 
-            references = self._message_references(newmsgid)
-            if any(self.revoke_message_ids.get(reference) for reference in references):
-                self.logger.debug("Ignoring revoke feedback for message references %s", references)
-                return
-
-            message_uid = next(
-                (
-                    reference
-                    for reference in references
-                    if coordinator.master.get_message_by_id(chat=chat, msg_id=reference) is not None
-                ),
-                newmsgid,
-            )
-            efb_msg = Message(chat=chat, uid=message_uid)
+            efb_msg = Message(chat = chat , uid = newmsgid)
             coordinator.send_status(
                 MessageRemoval(source_channel=self, destination_channel=coordinator.master, message=efb_msg)
             )
@@ -412,27 +352,14 @@ class ComWeChatChannel(SlaveChannel):
             content = {}
             sender = msg["sender"]
             fromnickname = re.search('fromnickname="(.*?)"', msg["message"]).group(1)
-            wxid = re.search('fromusername="(.*?)"', msg["message"]).group(1)
-            sign = re.search('sign="(.*?)"', msg["message"]).group(1)
             apply_content = re.search('content="(.*?)"', msg["message"]).group(1)
-            chatroom = re.search('chatroomusername="(.*?)"', msg["message"]).group(1)
-            source = "朋友验证消息"
-            if chatroom:
-                source = f"来自群聊: {self.get_name_by_wxid(chatroom)}"
-            else:
-                sharecardnickname = re.search('sharecardnickname="(.*?)"', msg["message"]).group(1)
-                if sharecardnickname:
-                    source = f"对方通过 \"{sharecardnickname}\" 分享的名片添加"
             url = re.search('bigheadimgurl="(.*?)"', msg["message"]).group(1)
             v3 = re.search('encryptusername="(v3.*?)"', msg["message"]).group(1)
             v4 = re.search('ticket="(v4.*?)"', msg["message"]).group(1)
             text = (
                 "好友申请:\n"
                 f"名字: {fromnickname}\n"
-                f"微信号: {wxid}\n"
-                f"个性签名: {sign}\n"
                 f"验证内容: {apply_content}\n"
-                f"来源: {source}\n"
                 f"头像: {url}"
             )
 
@@ -455,6 +382,7 @@ class ComWeChatChannel(SlaveChannel):
             self.logger.debug(f"card_msg:{msg}")
             sender = msg["sender"]
             wxid = msg["wxid"]
+            content = {}
             name = self.get_name_by_wxid(sender)
 
             bigheadimgurl = re.search('bigheadimgurl="(.*?)"', msg["message"]).group(1)
@@ -462,6 +390,7 @@ class ComWeChatChannel(SlaveChannel):
             province = re.search('province="(.*?)"', msg["message"]).group(1)
             city = re.search('city="(.*?)"', msg["message"]).group(1)
             sex = re.search('sex="(.*?)"', msg["message"]).group(1)
+            username = re.search('username="(.*?)"', msg["message"]).group(1)
 
             text = "名片信息:\n"
             if nickname:
@@ -480,6 +409,14 @@ class ComWeChatChannel(SlaveChannel):
             if bigheadimgurl:
                 text += f"头像: {bigheadimgurl}\n"
 
+            commands = [
+                MessageCommand(
+                    name=("Add To Friend"),
+                    callable_name="add_friend",
+                    kwargs={"v3" : username},
+                )
+            ]
+
             if "@chatroom" in sender:
                 chat = ChatMgr.build_efb_chat_as_group(EFBGroupChat(
                     uid = sender,
@@ -488,10 +425,13 @@ class ComWeChatChannel(SlaveChannel):
                 if sender == wxid:
                     author = chat.self
                 else:
-                    author = ChatMgr.build_efb_chat_as_member(
-                        chat,
-                        self.get_group_member(sender, wxid),
-                    )
+                    alias = self.group_members.get(sender,{}).get(wxid , None),
+                    alias = None if alias == name else alias
+                    author = ChatMgr.build_efb_chat_as_member(chat, EFBGroupMember(
+                        uid = wxid,
+                        name = name,
+                        alias = alias
+                    ))
             else:
                 chat = ChatMgr.build_efb_chat_as_private(EFBPrivateChat(
                     uid = sender,
@@ -508,7 +448,7 @@ class ComWeChatChannel(SlaveChannel):
                 type=MsgType.Text,
                 text=text
             )
-            self.send_efb_msgs(m, author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
+            self.send_efb_msgs(MsgWrapper(msg, m), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
     def is_login(self) -> bool:
         try:
@@ -522,7 +462,7 @@ class ComWeChatChannel(SlaveChannel):
         
         # 检查是否返回了 JSON 数据（已登录）
         try:
-            json.loads(result)
+            json_result = json.loads(result)
             return None
         except Exception:
             return self.save_qr_code(result)
@@ -548,8 +488,7 @@ class ComWeChatChannel(SlaveChannel):
             uid=MessageID(str(int(time.time()))),
         )
         if self.is_login():
-            self.get_me()
-            self.GetContactListBySql()
+            self.after_login()
             msg.text = "登录成功"
         else:
             msg.text = "登录失败，请重新登录"
@@ -605,11 +544,9 @@ class ComWeChatChannel(SlaveChannel):
         for efb_msg in efb_msgs:
             for k, v in kwargs.items():
                 setattr(efb_msg, k, v)
-            try:
-                coordinator.send_message(efb_msg)
-            finally:
-                if efb_msg.file:
-                    efb_msg.file.close()
+            coordinator.send_message(efb_msg)
+            if efb_msg.file:
+                efb_msg.file.close()
 
     def system_msg(self, content : Dict):
         self.logger.debug(f"system_msg:{content}")
@@ -637,36 +574,7 @@ class ComWeChatChannel(SlaveChannel):
         if "target" in content:
             msg.target = content['target']
 
-        self.send_efb_msgs(msg, uid=MessageID(str(int(time.time()))), chat=chat, author=author, type=MsgType.Text)
-
-    def _message_references(self, msgid: MessageID) -> list[MessageID]:
-        references = [MessageID(str(msgid))]
-        svrid = str(msgid)
-        if not svrid.isdigit() or int(svrid) <= 0:
-            return references
-
-        try:
-            db_names = self.dbkey.database_names("MSG") or []
-        except Exception:
-            self.logger.debug("Failed to discover message database names", exc_info=True)
-            return references
-
-        for db_name in sorted(db_names):
-            match = re.fullmatch(r"MSG(\d+)\.db", db_name)
-            if match is None:
-                continue
-            response = self.query_database(
-                db_name=db_name,
-                sql=f"select localId from MSG where MsgSvrID={svrid};",
-            )
-            rows = response.get("data") if isinstance(response, dict) and response.get("result") == "OK" else None
-            if not isinstance(rows, list) or len(rows) != 2 or len(rows[1]) != 1 or not str(rows[1][0]).isdigit():
-                continue
-            localref = MessageID(f"local:{int(match.group(1)) + 1}:{int(rows[1][0])}")
-            if is_message_reference(localref):
-                references.append(localref)
-            break
-        return references
+        self.send_efb_msgs(msg, uid=int(time.time()), chat=chat, author=author, type=MsgType.Text)
 
     def handle_msg(self , msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
         emojiList = re.findall('\[[\w|！|!| ]+\]' , msg["message"])
@@ -678,15 +586,9 @@ class ComWeChatChannel(SlaveChannel):
 
         if msg["msgid"] not in self.cache:
             self.cache[msg["msgid"]] = msg["type"]
-            references = self._message_references(MessageID(str(msg["msgid"]))) if msg.get("isSendMsg") else [msg["msgid"]]
-            for reference in references:
-                if coordinator.master.get_message_by_id(chat=chat, msg_id=reference) is not None:
-                    return
         else:
             if self.cache[msg["msgid"]] == msg["type"]:
                 return
-
-        self._schedule_mark_as_read(msg, chat)
 
         try:
             if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
@@ -712,342 +614,102 @@ class ComWeChatChannel(SlaveChannel):
             return
 
         try:
-            if msg.get("type") == "animatedsticker":
-                processed = MsgProcess(
-                    msg,
-                    chat,
-                    self.direct_transfer,
-                    animated_sticker_resolver=self._resolve_animated_sticker,
-                )
-            else:
-                processed = MsgProcess(
-                    msg,
-                    chat,
-                    self.direct_transfer,
-                    self._message_references,
-                )
-            self.send_efb_msgs(
-                processed,
-                author=author,
-                chat=chat,
-                uid=MessageID(str(msg['msgid']))
-            )
-            if getattr(self, "delete_media_after_send", False) and msg.get("type") in MEDIA_DELETE_TYPES:
-                resolved_path = (
-                    resolve_hooked_wechat_image_path(msg.get("filepath"))
-                    if msg.get("type") == "image" else None
-                )
-                self.media_retries.delete_files(msg.get("filepath"), resolved_path)
+            efb_msgs = MsgProcess(msg, chat)
         except Exception:
-            if msg.get("type") not in MEDIA_RETRY_TYPES:
-                raise
-            self.logger.exception(
-                "Failed to process media: type=%s msgid=%s filepath=%s",
-                msg.get("type"), msg.get("msgid"), msg.get("filepath"),
-            )
-            try:
-                self.media_retries.send_failure(msg.get("filepath"), msg, author, chat)
-            except Exception:
-                self.logger.exception("Failed to send media failure message")
+            # 单条消息处理失败时降级为文本提示,避免异常上浮拖死接收线程导致后续消息丢失
+            self.logger.exception("MsgProcess 处理消息失败,降级为文本提示: type=%s", msg.get("type"))
+            msg['message'] = f"[{msg.get('type')} 接收失败,请在手机端查看]"
+            msg["type"] = "text"
+            efb_msgs = MsgProcess(msg, chat)
+        self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
-    def _mark_as_read_response_ok(self, response: Dict[str, Any]) -> bool:
-        return (
-            isinstance(response, dict)
-            and response.get("result") == "OK"
-            and str(response.get("msg")) == "1"
-        )
+    def _file_is_stable(self, path: str, interval: float = 1.0) -> bool:
+        """文件存在且大小在 interval 秒内不再变化(下载完成),才算就绪。
 
-    def _mark_chat_as_read(self, chat_uid: ChatID, reason: str) -> None:
-        if not self.mark_as_read_enabled or not chat_uid:
-            return
-
-        chat_key = str(chat_uid)
-        with self.mark_as_read_lock:
-            timer = self.mark_as_read_timers.pop(chat_key, None)
-            if timer is not None and timer is not threading.current_thread():
-                timer.cancel()
-
+        避免读到 Hook 正在写入的半截文件导致图片解码失败。
+        """
         try:
-            response = self.bot.MarkAsRead(wxid=chat_key)
-        except Exception:
-            self.logger.exception("Failed to mark chat as read: chat=%s reason=%s", chat_key, reason)
+            size1 = os.path.getsize(path)
+        except OSError:
+            return False
+        if size1 <= 0:
+            return False
+        time.sleep(interval)
+        try:
+            size2 = os.path.getsize(path)
+        except OSError:
+            return False
+        return size1 == size2
+
+    def _deliver_pending_file(self, path: str):
+        """处理一条延迟等待的文件消息,成功或降级后从队列移除。"""
+        msg = self.file_msg[path][0]
+        author = self.file_msg[path][1]
+        chat = self.file_msg[path][2]
+
+        # 下载超时:降级为文本提示,避免无限等待
+        if (int(time.time()) - msg["timestamp"]) > self.time_out:
+            self.logger.warning("文件 %s 下载超时,降级为文本提示", path)
+            msg['message'] = f"[{msg['type']} 下载超时,请在手机端查看]"
+            msg["type"] = "text"
+            del self.file_msg[path]
+            self.send_efb_msgs(MsgWrapper(msg, MsgProcess(msg, chat)), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
             return
 
-        if not self._mark_as_read_response_ok(response):
-            self.logger.warning(
-                "Native mark-as-read failed: chat=%s reason=%s response=%s",
-                chat_key,
-                reason,
-                response,
-            )
-            return
-        self.logger.debug("Marked chat as read: chat=%s reason=%s", chat_key, reason)
-
-    def _schedule_mark_as_read(self, msg: Dict[str, Any], chat: 'Chat') -> None:
-        if not self.mark_as_read_enabled:
-            return
-        if msg.get("isSendMsg") in (1, True, "1"):
-            return
-        if msg.get("type") in {"sysmsg", "sysnotify", "eventnotify"}:
-            return
-
-        chat_uid = getattr(chat, "uid", None)
-        if not chat_uid:
-            return
-
-        chat_key = str(chat_uid)
-        with self.mark_as_read_lock:
-            timer = self.mark_as_read_timers.get(chat_key)
-            if timer is not None and timer.is_alive():
+        # 语音:文件未出现时尝试从数据库提取音频数据
+        if msg["type"] == "voice" and not os.path.exists(path):
+            try:
+                sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
+                dbresult = self.bot.QueryDatabase(db_handle=self.bot.GetDBHandle("MediaMSG0.db"), sql=sql)["data"]
+                if len(dbresult) == 2:
+                    filebuffer = dbresult[1][0]
+                    decoded = bytes(base64.b64decode(filebuffer))
+                    with open(msg["filepath"], 'wb') as f:
+                        f.write(decoded)
+            except Exception:
+                self.logger.exception("从数据库提取语音失败,继续等待文件: %s", path)
                 return
 
-            timer = threading.Timer(
-                self.mark_as_read_delay,
-                self._mark_chat_as_read,
-                args=(chat_key, "inbound"),
-            )
-            timer.daemon = True
-            self.mark_as_read_timers[chat_key] = timer
-            timer.start()
-        self.logger.debug(
-            "Scheduled mark-as-read: chat=%s delay=%ss msgid=%s",
-            chat_key,
-            self.mark_as_read_delay,
-            msg.get("msgid"),
-        )
-
-    def _voice_database_names(self, refresh=False):
-        cached = getattr(self, "_voice_db_names", None)
-        if cached is not None and not refresh:
-            return list(cached)
-
-        names = []
-        dbkey = getattr(self, "dbkey", None)
-        discover = getattr(dbkey, "database_names", None)
-        if callable(discover):
-            try:
-                names = [
-                    name
-                    for name in (discover("MediaMSG") or [])
-                    if isinstance(name, str) and name.startswith("MediaMSG")
-                ]
-            except Exception:
-                self.logger.debug("Failed to discover WeChat media databases", exc_info=True)
-
-        if not names:
-            try:
-                handles = self.bot.GetDatabaseHandles().get("data") or []
-                names = [
-                    item.get("db_name")
-                    for item in handles
-                    if isinstance(item, dict)
-                    and isinstance(item.get("db_name"), str)
-                    and item["db_name"].startswith("MediaMSG")
-                ]
-            except Exception:
-                self.logger.debug("Failed to discover native media database handles", exc_info=True)
-
-        if not names:
-            names = list(VOICE_DATABASE_NAMES)
-        return sorted(set(names), key=lambda name: (len(name), name))
-
-    def retry_media(self, retry_id):
-        return self.media_retries.retry(retry_id)
-
-    def _resolve_animated_sticker(self, msg):
-        return self.sticker_cache.get_or_download(msg, wait=MEDIA_WAIT_SECONDS)
-
-    def GetMsgCdn(self, msgid):
-        try:
-            response = self.bot.GetCdn(msgid=msgid)
-        except Exception:
-            self.logger.exception(
-                "Failed to request media from ComWeChat: msgid=%s",
-                msgid,
-            )
-            return None
-
-        if (
-            isinstance(response, dict)
-            and response.get("error_code") == "message_recalled"
-        ):
-            raise MediaPermanentlyUnavailable(
-                response.get("err_msg") or "message recalled"
-            )
-
-        raw_path = response.get("path") if isinstance(response, dict) else None
-        if not isinstance(raw_path, str) or not raw_path:
-            self.logger.warning(
-                "ComWeChat returned no media path: msgid=%s response=%r",
-                msgid,
-                response,
-            )
-            return None
-
-        normalized_path = raw_path.replace("\\", "/")
-        base_path = str(self.base_path).replace("\\", "/").rstrip("/")
-        prefix = f"{base_path}/"
-        if normalized_path.lower().startswith(prefix.lower()):
-            relative_path = normalized_path[len(prefix):]
-            return os.path.join(self.dir, *relative_path.split("/"))
-        return normalized_path
-
-    def _process_pending_file(self, path):
-        flag = False
-        msg, author, chat = self.file_msg[path]
-        media_type = msg.get("type")
-        output_msg = msg
-        resolved_path = resolve_hooked_wechat_image_path(path) if msg["type"] == "image" else None
-        if resolved_path:
-            msg["filepath"] = resolved_path
-            flag = True
-        elif os.path.isfile(path):
-            flag = True
-        elif (
-            media_type in MEDIA_RETRY_TYPES
-            and (int(time.time()) - msg["timestamp"]) >= MEDIA_WAIT_SECONDS
-        ):
-            self.media_retries.send_failure(
-                path,
-                msg,
-                author,
-                chat,
-                text=f"[{media_type} 下载超时,请在手机端查看]",
-            )
-            self.file_msg.pop(path, None)
+        # 文件就绪且稳定才处理,避免读到下载中的半截文件
+        if not (os.path.exists(path) and self._file_is_stable(path)):
             return
-        elif msg["type"] == "voice":
-            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
-            queried_databases = []
 
-            def query_voice_databases(database_names):
-                queried_databases.clear()
-                query_failed = False
-                query_error = None
-                for db_name in database_names:
-                    queried_databases.append(db_name)
-                    try:
-                        dbresp = self.query_database(db_name=db_name, sql=sql)
-                        if not isinstance(dbresp, dict) or dbresp.get("result") != "OK":
-                            query_failed = True
-                            query_error = "voice database query returned %r" % (dbresp,)
-                            continue
-
-                        dbresult = dbresp.get("data") or []
-                        data_rows = dbresult
-                        if dbresult and dbresult[0] and dbresult[0][0] == "Buf":
-                            data_rows = dbresult[1:]
-                    except Exception as exc:
-                        query_failed = True
-                        query_error = repr(exc)
-                        continue
-
-                    if data_rows:
-                        return data_rows[-1][0], False, None
-                return None, query_failed, query_error
-
-            database_names = self._voice_database_names()
-            for attempt in range(2):
-                filebuffer, query_failed, query_error = query_voice_databases(database_names)
-                if filebuffer is None and query_failed:
-                    self._voice_db_names = None
-                    if attempt == 0:
-                        try:
-                            self.bot.invalidate_db_handles()
-                        except Exception:
-                            self.logger.debug("Failed to invalidate native database handles", exc_info=True)
-                        database_names = self._voice_database_names(refresh=True)
-                        continue
-
-                    self.logger.error(
-                        "[voice-db-failure] msgid=%s db=%s sql=%s error=%s",
-                        msg.get("msgid"),
-                        ",".join(queried_databases),
-                        sql,
-                        query_error,
-                    )
-                    break
-
-                self._voice_db_names = list(database_names)
-                if filebuffer is not None:
-                    try:
-                        decoded = bytes(base64.b64decode(filebuffer))
-                        with open(msg["filepath"], 'wb') as f:
-                            f.write(decoded)
-                    except Exception as e:
-                        self.logger.error(
-                            "[voice-file-failure] msgid=%s path=%s error=%r",
-                            msg.get("msgid"),
-                            msg.get("filepath"),
-                            e,
-                            exc_info=True,
-                        )
-                    else:
-                        flag = True
-                else:
-                    self.logger.debug(
-                        "[voice-db-empty] msgid=%s db=%s sql=%s",
-                        msg.get("msgid"),
-                        ",".join(queried_databases),
-                        sql,
-                    )
-                break
-
-        if flag:
-            if output_msg.get("type") == "animatedsticker":
-                processed = MsgProcess(
-                    output_msg,
-                    chat,
-                    self.direct_transfer,
-                    animated_sticker_resolver=self._resolve_animated_sticker,
-                )
-            else:
-                processed = MsgProcess(output_msg, chat, self.direct_transfer)
-            self.send_efb_msgs(
-                processed,
-                author=author,
-                chat=chat,
-                uid=MessageID(str(output_msg['msgid'])),
-            )
-            self.file_msg.pop(path, None)
-            if getattr(self, "delete_media_after_send", False) and media_type in MEDIA_DELETE_TYPES:
-                self.media_retries.delete_files(path, output_msg.get("filepath"))
+        del self.file_msg[path]
+        try:
+            efb_msgs = MsgProcess(msg, chat)
+        except Exception:
+            self.logger.exception("处理文件消息失败,降级为文本提示: %s", path)
+            msg['message'] = f"[{msg['type']} 接收失败,请在手机端查看]"
+            msg["type"] = "text"
+            efb_msgs = MsgProcess(msg, chat)
+        self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
     def handle_file_msg(self):
         while True:
-            if len(self.file_msg) == 0:
-                time.sleep(1)
-            else:
+            try:
                 for path in list(self.file_msg.keys()):
-                    msg = {}
                     try:
-                        msg = self.file_msg[path][0]
-                        self._process_pending_file(path)
+                        self._deliver_pending_file(path)
                     except Exception:
-                        pending = self.file_msg.pop(path, None)
-                        if pending:
-                            failed_msg, author, chat = pending
-                            if failed_msg.get("type") in MEDIA_RETRY_TYPES:
-                                try:
-                                    self.media_retries.send_failure(path, failed_msg, author, chat)
-                                except Exception:
-                                    self.logger.exception("Failed to send media failure message")
-                        self.logger.exception(
-                            "Failed to process pending media: type=%s msgid=%s filepath=%s",
-                            msg.get("type"), msg.get("msgid"), msg.get("filepath", path),
-                        )
-                time.sleep(1)
-
-            if len(self.delete_file):
-                for k in list(self.delete_file.keys()):
-                    file_path = k
-                    begin_time = self.delete_file[k]
-                    if  (int(time.time()) - begin_time) > self.time_out:
+                        # 单条消息异常不能拖死整个处理线程,否则后续所有延迟消息都收不到
+                        self.logger.exception("处理延迟文件消息异常,已跳过: %s", path)
                         try:
-                            os.remove(file_path)
-                        except:
+                            del self.file_msg[path]
+                        except KeyError:
                             pass
-                        del self.delete_file[file_path]
+                if len(self.delete_file):
+                    for k in list(self.delete_file.keys()):
+                        file_path = k
+                        begin_time = self.delete_file[k]
+                        if  (int(time.time()) - begin_time) > self.time_out:
+                            try:
+                                os.remove(file_path)
+                            except:
+                                pass
+                            del self.delete_file[file_path]
+            except Exception:
+                self.logger.exception("handle_file_msg 主循环异常,稍后继续")
+            time.sleep(1)
 
     def process_friend_request(self , v3 , v4):
         self.logger.debug(f"process_friend_request:{v3} {v4}")
@@ -1084,6 +746,7 @@ class ComWeChatChannel(SlaveChannel):
             count += 1
             if count % 1800 == 0:
                 if self.wxid is not None:
+                    self.GetGroupListBySql()
                     self.GetContactListBySql()
             if count % 1800 == 3:
                 if getattr(coordinator, 'master', None) is not None and not self.is_login():
@@ -1110,10 +773,12 @@ class ComWeChatChannel(SlaveChannel):
     def send_message(self, msg : Message) -> Message:
         chat_uid = msg.chat.uid
 
+        if msg.edit:
+            pass     # todo
+
         if self.wxid is None:
             if self.is_login():
-                self.get_me()
-                self.GetContactListBySql()
+                self.after_login()
             else:
                 content = {
                     "name": self.user_auth_chat.name,
@@ -1123,66 +788,17 @@ class ComWeChatChannel(SlaveChannel):
                 self.system_msg(content)
                 return msg
 
-        self._mark_chat_as_read(chat_uid, "outbound")
-
-        if msg.edit:
-            if (msg.text or "").startswith("/"):
-                raise EFBMessageError("不支持编辑命令消息")
-
-            references = list(dict.fromkeys(load_message_ids(msg.uid))) if msg.uid else []
-            if not references:
-                raise EFBMessageError("编辑消息缺少有效的消息 ID")
-            invalid_reference = next(
-                (reference for reference in references if not is_message_reference(reference)),
-                None,
-            )
-            if invalid_reference:
-                raise EFBMessageError(f"无效的消息 ID: {invalid_reference}")
-
-            if not msg.edit_media and msg.type in (
-                MsgType.Voice,
-                MsgType.Image,
-                MsgType.File,
-                MsgType.Video,
-                MsgType.Animation,
-                MsgType.Sticker,
-            ):
-                media_reference = references[0]
-                caption_references = references[1:]
-                if caption_references:
-                    caption = Message(
-                        chat=msg.chat,
-                        uid=dump_message_ids(caption_references),
-                    )
-                    self.send_status(MessageRemoval(self, self, caption))
-                if msg.text:
-                    caption_reference = self.send_text(chat_uid, msg)
-                    if caption_reference is None:
-                        raise EFBMessageError("发送失败，请在手机端确认")
-                    msg.uid = dump_message_ids([media_reference, caption_reference])
-                else:
-                    msg.uid = media_reference
-                return msg
-
-            self.send_status(MessageRemoval(self, self, msg))
-
-        if msg.text and not msg.edit:
+        if msg.text:
             match = re.search(self.forward_pattern, msg.text)
             if match:
                 if match.group(1) == hashlib.md5(self.channel_id.encode('utf-8')).hexdigest():
                     msgid = match.group(2)
                     self.logger.debug(f"提取到的消息 ID: {msgid}")
-                    response = self.bot.ForwardMessage(wxid=chat_uid, msgid=msgid)
-                    reference = self._send_message_reference(response)
-                    if reference is None:
-                        raise EFBMessageError("转发失败，请在手机端确认")
-                    msg.uid = dump_message_ids([reference])
+                    self.bot.ForwardMessage(wxid = chat_uid, msgid = msgid)
                 else:
                     self.logger.debug(f"非本 slave 消息: {match.group(1)}/{match.group(2)}")
                 return msg
 
-        res= {"msg": "1"}
-        msg_ids: list[MessageID] = []
         if msg.type == MsgType.Voice:
             f = tempfile.NamedTemporaryFile(prefix='voice_message_', suffix=".mp3")
             AudioSegment.from_ogg(msg.file.name).export(f, format="mp3")
@@ -1199,10 +815,15 @@ class ComWeChatChannel(SlaveChannel):
                 memberlist = self.bot.GetChatroomMemberList(chatroom_id = chat_uid)
                 message = '群组成员包括：'
                 for wxid in memberlist['members'].split('^G'):
-                    name = self.get_name_by_wxid(wxid)
+                    try:
+                        name = self.contacts[wxid]
+                    except:
+                        try:
+                            name = self.bot.GetChatroomMemberNickname(chatroom_id = chat_uid, wxid = wxid)['nickname'] or wxid
+                        except:
+                            name = wxid
                     message += '\n' + wxid + ' : ' + name
                 self.system_msg({'sender':chat_uid, 'message':message})
-                return msg
             elif msg.text.startswith('/getstaticinfo'):
                 info = msg.text[15::]
                 if info == 'friends':
@@ -1216,7 +837,6 @@ class ComWeChatChannel(SlaveChannel):
                 else:
                     message = '当前仅支持查询friends, groups, group_members, contacts'
                 self.system_msg({'sender':chat_uid, 'message':message})
-                return msg
             elif msg.text.startswith('/helpcomwechat'):
                 message = '''/search - 按关键字匹配好友昵称搜索联系人
 
@@ -1234,22 +854,20 @@ class ComWeChatChannel(SlaveChannel):
 
 /getstaticinfo - 可获取friends, groups, contacts信息'''
                 self.system_msg({'sender':chat_uid, 'message':message})
-                return msg
             elif msg.text.startswith('/search'):
                 keyword = msg.text[8::]
                 message = 'result:'
                 for key, value in self.contacts.items():
-                    if keyword in key or any(keyword in value[field] for field in ('nickname', 'remark')):
+                    if keyword in value:
                         message += '\n' + str(key) + " : " + str(value)
                 self.system_msg({'sender':chat_uid, 'message':message})
-                return msg
             elif msg.text.startswith('/addtogroup'):
                 users = msg.text[12::]
                 res = self.bot.AddChatroomMember(chatroom_id = chat_uid, wxids = users)
             elif msg.text.startswith('/forward'):
                 if isinstance(msg.target, Message):
-                    msgid = next((item for item in load_message_ids(msg.target.uid) if is_message_reference(item)), None)
-                    if msgid:
+                    msgid = msg.target.uid
+                    if msgid.isdecimal():
                         url = f"ehforwarderbot://{hashlib.md5(self.channel_id.encode('utf-8')).hexdigest()}/forward/{msgid}"
                         prompt = "请将这条信息转发到目标聊天中"
                         text = f"{url}\n{prompt}"
@@ -1277,9 +895,8 @@ class ComWeChatChannel(SlaveChannel):
                     users, message = users_message[0], ''
                 if users != '':
                     res = self.bot.SendAt(chatroom_id = chat_uid, wxids = users, msg = message)
-                    msg_ids.append(self._send_message_reference(res))
                 else:
-                    msg_ids.append(self.send_text(chat_uid, msg))
+                    self.bot.SendText(wxid = chat_uid , msg = msg.text)
             elif msg.text.startswith('/sendcard'):
                 user_nickname = msg.text[10::].split(' ', 1)
                 if len(user_nickname) == 2:
@@ -1288,9 +905,8 @@ class ComWeChatChannel(SlaveChannel):
                     user, nickname = user_nickname[0], ''
                 if user != '':
                     res = self.bot.SendCard(receiver = chat_uid, share_wxid = user, nickname = nickname)
-                    msg_ids.append(self._send_message_reference(res))
                 else:
-                    msg_ids.append(self.send_text(chat_uid, msg))
+                    self.bot.SendText(wxid = chat_uid , msg = msg.text)
             elif msg.text.startswith('/addfriend'):
                 user_invite = msg.text[11::].split(' ', 1)
                 if len(user_invite) == 2:
@@ -1300,115 +916,133 @@ class ComWeChatChannel(SlaveChannel):
                 if user != '':
                     res = self.bot.AddContactByWxid(wxid = user, msg = invite)
                 else:
-                    msg_ids.append(self.send_text(chat_uid, msg))
+                    self.bot.SendText(wxid = chat_uid , msg = msg.text)
             else:
-                # Standard text message or quote reply
-                msg_ids.append(self.send_text(chat_uid, msg))
+                res = self.send_text(wxid = chat_uid , msg = msg)
         elif msg.type in [MsgType.Link]:
-            msg_ids.append(self.send_text(chat_uid, msg))
-        elif msg.type in [MsgType.Image]:
-            msg_ids.append(self.send_image(chat_uid, msg))
+            self.send_text(wxid = chat_uid , msg = msg)
+        elif msg.type in [MsgType.Image , MsgType.Sticker]:
+            name = os.path.basename(msg.file.name)
+            local_path = f"{self.dir}{self.wxid}/{name}"
+            load_temp_file_to_local(msg.file, local_path)
+            
+            # WSL环境下需要将路径转换为Windows格式
+            if self.is_wsl:
+                img_path = self._wsl_to_windows_path(local_path)
+                self.logger.debug(f"WSL路径转换: {local_path} -> {img_path}")
+            else:
+                img_path = os.path.join(self.base_path, self.wxid, name)
+            
+            self.logger.debug(f"发送图片路径: {img_path}")
+            res = self.bot.SendImage(receiver = chat_uid , img_path = img_path)
+            self.delete_file[local_path] = int(time.time())
             if msg.text:
-                msg_ids.append(self.send_text(chat_uid, msg))
-        elif msg.type in [MsgType.File, MsgType.Video]:
-            msg_ids.append(self.send_file(chat_uid, msg))
+                self.send_text(wxid = chat_uid , msg = msg)
+        elif msg.type in [MsgType.File , MsgType.Video]:
+            name = os.path.basename(msg.file.name)
+            local_path = f"{self.dir}{self.wxid}/{name}"
+            load_temp_file_to_local(msg.file, local_path)
+            
+            if msg.filename:
+                try:
+                    os.rename(local_path , f"{self.dir}{self.wxid}/{msg.filename}")
+                except:
+                    os.replace(local_path , f"{self.dir}{self.wxid}/{msg.filename}")
+                local_path = f"{self.dir}{self.wxid}/{msg.filename}"
+            
+            # WSL环境下需要将路径转换为Windows格式
+            if self.is_wsl:
+                file_path = self._wsl_to_windows_path(local_path)
+                self.logger.debug(f"WSL路径转换: {local_path} -> {file_path}")
+            else:
+                filename = msg.filename if msg.filename else name
+                file_path = os.path.join(self.base_path, self.wxid, filename)
+            
+            self.logger.debug(f"发送文件路径: {file_path}")
+            res = self.bot.SendFile(receiver = chat_uid , file_path = file_path)
+            self.delete_file[local_path] = int(time.time())
             if msg.text:
-                msg_ids.append(self.send_text(chat_uid, msg))
+                self.send_text(wxid = chat_uid , msg = msg)
             if msg.type == MsgType.Video:
                 res["msg"] = 1
-        elif msg.type in [MsgType.Animation, MsgType.Sticker]:
-            msg_ids.append(self.send_emotion(chat_uid, msg))
+        elif msg.type in [MsgType.Animation]:
+            name = os.path.basename(msg.file.name)
+            local_path = f"{self.dir}{self.wxid}/{name}"
+            load_temp_file_to_local(msg.file, local_path)
+            
+            # WSL环境下需要将路径转换为Windows格式
+            if self.is_wsl:
+                file_path = self._wsl_to_windows_path(local_path)
+                self.logger.debug(f"WSL路径转换: {local_path} -> {file_path}")
+            else:
+                file_path = os.path.join(self.base_path, self.wxid, name)
+            
+            self.logger.debug(f"发送动画表情路径: {file_path}")
+            res = self.bot.SendEmotion(wxid = chat_uid , img_path = file_path)
+            self.delete_file[local_path] = int(time.time())
             if msg.text:
-                msg_ids.append(self.send_text(chat_uid, msg))
+                self.send_text(wxid = chat_uid , msg = msg)
 
-        ids = [item for item in msg_ids if item is not None]
-        if not (str(res.get("msg", "1")) == "0" or ids):
-            self.logger.warning(f"Failed to get msgid confirmation for message type {msg.type} to {chat_uid} with {msg.uid}")
-            if "@openim" in chat_uid:  # 上游 bug，永远不返回企业微信的 msgid
-                return msg
-            raise EFBMessageError("发送失败，请在手机端确认")
-        elif ids:
-            # 保存所有消息 id 以在撤回消息时使用
-            msg.uid = dump_message_ids(ids)
-
+        try:
+            if str(res["msg"]) == "0":
+                raise EFBMessageError("发送失败，请在手机端确认")
+        except:
+            ...
         return msg
 
-    def _get_file_lock(self, wxid: ChatID) -> threading.Lock:
-        """Gets or creates a lock for the given chat ID."""
-        with self._file_locks_lock:
-            if wxid not in self._file_locks:
-                self._file_locks[wxid] = threading.Lock()
-            return self._file_locks[wxid]
-
-    @staticmethod
-    def _send_message_reference(response: Dict) -> Optional[MessageID]:
-        if not isinstance(response, dict) or response.get("result") != "OK":
-            return None
-        localref = MessageID(str(response.get("localref", "")))
-        return localref if is_message_reference(localref) else None
-
-    def send_text(self, wxid: ChatID, msg: Message):
-        """Sends a text message and returns its native message reference."""
-        text_to_send = msg.text
-
-        if isinstance(msg.target, Message) and text_to_send:
-            msgid = next((item for item in load_message_ids(msg.target.uid) if is_message_reference(item)), None)
-            send_quote_text = getattr(self.bot, "SendQuoteText", None)
-            if msgid and callable(send_quote_text):
-                response = send_quote_text(wxid=wxid, msg=text_to_send, target_msgid=msgid)
-            else:
-                text_to_send = qutoed_text(msg.target.text, text_to_send)
-                response = self.bot.SendText(wxid=wxid, msg=text_to_send)
-        else:
-            response = self.bot.SendText(wxid=wxid, msg=text_to_send)
-
-        return self._send_message_reference(response)
-
-    def _save_file(self, msg: Message, rename: bool = False):
-        name = os.path.basename(msg.file.name)
-        if rename and msg.filename and msg.filename != name:
-            name = msg.filename
-
-        local_path = f"{self.dir}{self.wxid}/{name}"
-        load_temp_file_to_local(msg.file, local_path)
-        self.delete_file[local_path] = int(time.time())
-        # WSL 环境下转换为 Windows 路径,供 Windows 侧 Hook 读取 (来自 sddpljx)
-        if getattr(self, "is_wsl", False):
-            win_path = self._wsl_to_windows_path(local_path)
-            self.logger.debug(f"WSL路径转换: {local_path} -> {win_path}")
-            return win_path
-        return self.base_path + "\\" + self.wxid + "\\" + name
-
-    @staticmethod
-    def _send_file_with_lock(fn: Callable):
-        def deco(self, wxid: ChatID, msg: Message):
-            with self._get_file_lock(wxid):
-                return self._send_message_reference(fn(self, wxid, msg))
-        return deco
-
-    @_send_file_with_lock
-    def send_image(self, wxid: ChatID, msg: Message):
-        return self.bot.SendImage(receiver=wxid, img_path=self._save_file(msg))
-
-    @_send_file_with_lock
-    def send_file(self, wxid: ChatID, msg: Message):
-        return self.bot.SendFile(receiver=wxid, file_path=self._save_file(msg, True))
-
-    @_send_file_with_lock
-    def send_emotion(self, wxid: ChatID, msg: Message):
-        return self.bot.SendEmotion(wxid=wxid, img_path=self._save_file(msg))
+    def send_text(self, wxid: ChatID, msg: Message) -> 'Message':
+        text = msg.text
+        if isinstance(msg.target, Message):
+                if isinstance(msg.target.author, SelfChatMember) and isinstance(msg.target.deliver_to, SlaveChannel):
+                    qt_txt = msg.target.text or msg.target.type.name
+                    text = qutoed_text(qt_txt, msg.text)
+                else:
+                    msgid = msg.target.uid
+                    sender = msg.target.author.uid
+                    displayname = self.group_members.get(wxid,{}).get(sender, self.get_nickname_by_wxid(sender))
+                    content = escape(msg.target.vendor_specific.get("wx_xml", ""), {
+                        "\n": "&#x0A;",
+                        "\t": "&#x09;",
+                        '"': "&quot;",
+                    }) or msg.target.text
+                    comwechat_info = msg.target.vendor_specific.get("comwechat_info", {})
+                    if comwechat_info.get("type", None) == "animatedsticker":
+                        refer_type = 47
+                    elif msg.target.type == MsgType.Image:
+                        refer_type = 3
+                    elif msg.target.type == MsgType.Voice:
+                        refer_type = 34
+                    elif msg.target.type == MsgType.Video:
+                        refer_type = 43
+                    elif msg.target.type == MsgType.Sticker:
+                        refer_type = 47
+                    elif msg.target.type == MsgType.Location:
+                        refer_type = 48
+                    elif msg.target.type == MsgType.File:
+                        refer_type = 49
+                    elif comwechat_info.get("type", None) == "share":
+                        refer_type = 49
+                    else:
+                        refer_type = 1
+                    if content:
+                        content = "<content>%s</content>" % content
+                    else:
+                        content = "<content />"
+                    xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
+                    return self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+        return self.bot.SendText(wxid = wxid , msg = text)
 
     def get_chat_picture(self, chat: 'Chat') -> BinaryIO:
         wxid = chat.uid
-        result = self.get_picture_by_sql(wxid = wxid)
+        result = self.bot.GetPictureBySql(wxid = wxid)
         if result:
             return download_file(result)
         else:
             return None
 
-    def get_chat_member_picture(self, chat_member: 'ChatMember') -> Optional[BinaryIO]:
+    def get_chat_member_picture(self, chat_member: 'ChatMember') -> BinaryIO:
         wxid = chat_member.uid
-        result = self.get_picture_by_sql(wxid = wxid)
+        result = self.bot.GetPictureBySql(wxid = wxid)
         if result:
             return download_file(result)
         else:
@@ -1428,131 +1062,35 @@ class ComWeChatChannel(SlaveChannel):
             except Exception as e:
                 self.logger.error("Start failed. Reason: %s" % e)
 
-        self.media_retries.start()
         t = threading.Thread(target = self.handle_file_msg)
         t.daemon = True
         t.start()
 
     def send_status(self, status: 'Status'):
-        if not isinstance(status, MessageRemoval):
-            raise EFBOperationNotSupported()
-
-        message = status.message
-        references = list(dict.fromkeys(load_message_ids(message.uid)))
-        chat_uid = str(message.chat.uid)
-        if not references:
-            raise EFBMessageError("撤回消息缺少有效的消息 ID")
-
-        failures = []
-        for message_reference in references:
-            if not is_message_reference(message_reference):
-                raise EFBMessageError(f"无效的消息 ID: {message_reference}")
-
-            self.revoke_message_ids[message_reference] = True
-            try:
-                response = self.bot.RevokeMessage(
-                    wxid=chat_uid,
-                    msgid=message_reference,
-                )
-            except Exception as exc:
-                self.revoke_message_ids.pop(message_reference, None)
-                failures.append(str(exc))
-                continue
-
-            reason = self._revoke_failure_reason(response)
-            if reason is not None:
-                self.revoke_message_ids.pop(message_reference, None)
-
-                failures.append(reason)
-
-        if failures:
-            reason = "; ".join(failures)
-            if len(failures) == len(references):
-                raise EFBMessageError(f"消息撤回失败：{reason}")
-            raise EFBMessageError(f"部分消息撤回失败：{reason}")
-
-    @staticmethod
-    def _revoke_failure_reason(response: Any) -> Optional[str]:
-        if isinstance(response, dict) and response.get("result") == "OK" and "msg" not in response:
-            return "上游不支持撤回消息"
-        if not isinstance(response, dict) or str(response.get("msg")) != "1":
-            return response.get("err_msg") if isinstance(response, dict) else response
-        return None
+        ...
 
     def stop_polling(self):
-        with self.mark_as_read_lock:
-            timers = list(self.mark_as_read_timers.values())
-            self.mark_as_read_timers.clear()
-        for timer in timers:
-            timer.cancel()
-        self.media_retries.stop()
         self.db.stop_worker()
 
     def get_message_by_id(self, chat: 'Chat', msg_id: MessageID) -> Optional['Message']:
-        get_chat_msg = getattr(self.bot, "GetChatMsgBySvrId", None)
-        if not callable(get_chat_msg):
-            return None
-
-        try:
-            response = get_chat_msg(msgid=str(msg_id))
-        except Exception:
-            self.logger.debug("Failed to retrieve message by server ID: %s", msg_id, exc_info=True)
-            return None
-
-        data = response.get("data") if isinstance(response, dict) and response.get("result") == "OK" else None
-        if not isinstance(data, dict) or str(msg_id) not in {
-            str(data.get("msgid", "")),
-            str(data.get("localref", "")),
-        }:
-            return None
-        if str(data.get("sender")) != str(chat.uid):
-            self.logger.warning(
-                "Message server ID belongs to another chat: requested=%s actual=%s msgid=%s",
-                chat.uid,
-                data.get("sender"),
-                msg_id,
-            )
-            return None
-
-        try:
-            if data.get("type") == "animatedsticker":
-                processed = MsgProcess(
-                    data,
-                    chat,
-                    self.direct_transfer,
-                    animated_sticker_resolver=self._resolve_animated_sticker,
-                )
-            else:
-                processed = MsgProcess(data, chat, self.direct_transfer)
-        except Exception:
-            self.logger.debug("Failed to convert native message: %s", msg_id, exc_info=True)
-            return None
-
-        if isinstance(processed, list):
-            processed = next((item for item in processed if isinstance(item, Message)), None)
-        if not isinstance(processed, Message):
-            return None
-
-        processed.chat = chat
-        processed.uid = MessageID(str(msg_id))
-        if isinstance(chat, GroupChat):
-            processed.author = chat.self if data.get("isSendMsg") else ChatMgr.build_efb_chat_as_member(
-                chat,
-                self.get_group_member(chat.uid, data.get("wxid") or data["sender"]),
-            )
-        else:
-            processed.author = chat.self if data.get("isSendMsg") else chat.other
-        return processed
+        ...
 
     def get_name_by_wxid(self, wxid):
-        contact = self.get_contact_by_wxid(wxid)
-        if not contact:
-            return wxid
-        nickname = contact["nickname"]
-        remark = contact["remark"]
-        if remark:
-            return f"{remark}({nickname})"
-        return nickname or wxid
+        try:
+            name = self.contacts[wxid]
+            if name == "":
+                name = wxid
+        except:
+            data = self.bot.GetContactBySql(wxid = wxid)
+            if data:
+                name = data[3]
+                if name == "":
+                    name = wxid
+                else:
+                    self.contacts[wxid] = name
+            else:
+                name = wxid
+        return name
 
     @staticmethod
     def non_blocking_lock_wrapper(lock: threading.Lock) :
@@ -1572,156 +1110,36 @@ class ComWeChatChannel(SlaveChannel):
         self.me = self.bot.GetSelfInfo()["data"]
         self.wxid = self.me["wxId"]
 
-    def query_database(self, db_name: Optional[str] = None, sql: str = "", **params) -> Dict:
-        """Prefer dbkey-backed SQLCipher reads, then fall back to native handles."""
-        dbkey_result = self.dbkey.query(db_name, sql)
-        if dbkey_result is not None:
-            return dbkey_result
-        get_db_handle = getattr(self.bot, "GetDBHandle", None)
-        if db_name and "db_handle" not in params and callable(get_db_handle):
-            # 新版 python-comwechatrobot-http: QueryDatabase 改为要求 db_handle
-            # (通过 GetDBHandle(db_name) 向 Hook 获取原生数据库句柄),
-            # 不再接受 db_name
-            try:
-                params["db_handle"] = get_db_handle(db_name)
-                params.pop("db_name", None)
-            except Exception as exc:
-                self.logger.warning("获取数据库句柄失败(db=%s): %r, 回退到旧式调用", db_name, exc)
-        if db_name:
-            params.setdefault("db_name", db_name)
-        if sql:
-            params["sql"] = sql
-        return self.bot.QueryDatabase(**params)
-
-    def get_contact_by_sql(self, wxid: str) -> Optional[List[str]]:
-        if not wxid.endswith("@openim"):
-            db = "MicroMsg.db"
-            sql = f"select UserName,Alias,Remark,NickName,Type from Contact where UserName='{wxid}';"
-        else:
-            db = "OpenIMContact.db"
-            sql = f"select UserName,'' as Alias,Remark,NickName,Type from OpenIMContact where UserName='{wxid}';"
-        result = self.query_database(db_name=db, sql=sql)
-        data = result.get("data") or []
-        if len(data) > 1:
-            return data[1]
-        return None
-
-    def get_contact_list_by_sql(self) -> Dict:
-        contact_data: Dict[str, Dict[str, str]] = {}
-        contact_response = self.query_database(
-            db_name="MicroMsg.db",
-            sql="select UserName,Alias,Remark,NickName,Type from Contact",
-        )
-        contact_list = contact_response.get("data") or []
-        for index in range(1, len(contact_list)):
-            wxid = contact_list[index][0]
-            contact_data[wxid] = {
-                "alias": contact_list[index][1],
-                "remark": contact_list[index][2],
-                "nickname": contact_list[index][3],
-                "type": contact_list[index][4],
-            }
-        openim_response = self.query_database(
-            db_name="OpenIMContact.db",
-            sql="select UserName,'' as Alias,Remark,NickName,Type from OpenIMContact",
-        )
-        openim_list = openim_response.get("data") or []
-        for index in range(1, len(openim_list)):
-            wxid = openim_list[index][0]
-            contact_data[wxid] = {
-                "alias": openim_list[index][1],
-                "remark": openim_list[index][2],
-                "nickname": openim_list[index][3],
-                "type": openim_list[index][4],
-            }
-        return contact_data
-
-    def get_picture_by_sql(self, wxid: str) -> Optional[str]:
-        if not wxid.endswith("@openim"):
-            sql = f"select usrName,smallHeadImgUrl,bigHeadImgUrl from ContactHeadImgUrl where usrName='{wxid}';"
-            result = self.query_database(db_name="MicroMsg.db", sql=sql)
-        else:
-            sql = f"select UserName,SmallHeadImgUrl,BigHeadImgUrl from OpenIMContact where UserName='{wxid}';"
-            result = self.query_database(db_name="OpenIMContact.db", sql=sql)
-        try:
-            if result["data"][1][2] != "":
-                return result["data"][1][2]
-            if result["data"][1][1] != "":
-                return result["data"][1][1]
-            return None
-        except Exception:
-            return None
-
-    def get_all_group_members_by_sql(self) -> Dict:
-        group_data: Dict[str, Dict[str, str]] = {}
-        response = self.query_database(
-            db_name="MicroMsg.db",
-            sql="select ChatRoomName,RoomData from ChatRoom",
-        )
-        member_list = response.get("data") or []
-        chatroom = ChatRoom.ChatRoomData()
-        for index in range(1, len(member_list)):
-            group_member = {}
-            chatroom.ParseFromString(bytes(base64.b64decode(member_list[index][1])))
-            for member in chatroom.members:
-                group_member[member.wxID] = member.displayName or ""
-            group_data[member_list[index][0]] = group_member
-        return group_data
-
-    def get_group_alias_by(self, group_wxid, member_wxid):
-        return self.group_members.get(group_wxid, {}).get(member_wxid) or None
-
-    def get_contact_by_wxid(self, wxid):
-        contact = self.contacts.get(wxid)
-        if contact is not None:
-            return contact
-
-        data = self.get_contact_by_sql(wxid=wxid)
-        if not data:
-            return None
-
-        contact = {
-            "nickname": data[3] or "",
-            "remark": data[2] or "",
-        }
-        self.contacts[wxid] = contact
-        return contact
-
-    def is_friend(self, wxid):
-        contact = self.get_contact_by_wxid(wxid)
-        return bool(contact and contact.get("remark"))
-
-    def get_group_member(self, group_wxid, member_wxid):
-        contact = self.get_contact_by_wxid(member_wxid) or {}
-        group_alias = self.get_group_alias_by(group_wxid, member_wxid)
-        if self.is_friend(member_wxid):
-            name = contact.get("remark", "")
-        else:
-            name = contact.get("nickname") or member_wxid
-        return EFBGroupMember(
-            uid=member_wxid,
-            name=name,
-            alias=group_alias,
-        )
-
     def get_nickname_by_wxid(self, wxid):
-        contact = self.get_contact_by_wxid(wxid)
-        return contact["nickname"] if contact and contact["nickname"] else wxid
+        try:
+            nickname = self.nicknames[wxid]
+            if nickname == "":
+                nickname = wxid
+        except:
+            data = self.bot.GetContactBySql(wxid = wxid)
+            if data:
+                nickname = data[3]
+                if nickname == "":
+                    nickname = wxid
+                else:
+                    self.nicknames[wxid] = nickname
+            else:
+                nickname = wxid
+        return nickname
 
     #定时更新 Start
     @non_blocking_lock_wrapper(contact_update_lock)
     def GetContactListBySql(self):
         new_chats = []
         modified_chats = []
-        contacts = self.get_contact_list_by_sql()
+        contacts = self.bot.GetContactListBySql()
         for contact in contacts:
             data = contacts[contact]
-            self.contacts[contact] = {
-                "nickname": data["nickname"] or "",
-                "remark": data["remark"] or "",
-            }
-            name = self.get_name_by_wxid(contact)
-            if str(data["type"]) in {"0", "4"}:
+            name = (f"{data['remark']}({data['nickname']})") if data["remark"] else data["nickname"]
+
+            self.contacts[contact] = name
+            self.nicknames[contact] = data["nickname"]
+            if data["type"] == 0 or data["type"] == 4:
                 continue
 
             if "@chatroom" in contact:
@@ -1747,8 +1165,6 @@ class ComWeChatChannel(SlaveChannel):
                     self.friends.append(ChatMgr.build_efb_chat_as_private(new_entity))
                     new_chats.append(contact)
 
-        self.GetGroupListBySql()
-
         if new_chats or modified_chats:
             coordinator.send_status(ChatUpdates(channel=self, new_chats=new_chats, modified_chats=modified_chats))
 
@@ -1761,34 +1177,31 @@ class ComWeChatChannel(SlaveChannel):
     def merge_group_members(self, group, new_members):
         self.group_members[group] = self.group_members.get(group, {})
         for wxid, alias in new_members.items():
-            alias = alias or ""
             if self.group_members[group].get(wxid, None) != alias:
                 self.group_members[group][wxid] = alias
                 self.db.update_group_alias(group, wxid, alias)
 
+    @non_blocking_lock_wrapper(group_update_lock)
     def GetGroupListBySql(self):
-        groups = self.get_all_group_members_by_sql()
+        groups = self.bot.GetAllGroupMembersBySql()
         for group, members in groups.items():
-            with contextlib.suppress(EFBChatNotFound):
-                chat = self.get_chat(group)
-                for wxid, alias in members.items():
-                    ChatMgr.build_efb_chat_as_member(chat, self.get_group_member(group, wxid))
             self.merge_group_members(group, members)
 
     def extract_alias(self, msg):
         sender = msg["sender"]
+        extracted = False
         if "<refermsg>" in msg["message"]:
             xml = etree.fromstring(msg["message"])
             id = xml.xpath('string(/msg/appmsg/refermsg/chatusr)')
             alias = xml.xpath('string(/msg/appmsg/refermsg/displayname)')
             name = self.get_nickname_by_wxid(id)
             if alias and alias != name:
+                extracted = True
                 self.merge_group_members(sender, {
                     id: alias
                 })
-                return
 
-        if "<atuserlist>" in msg["extrainfo"]:
+        if not extracted and "<atuserlist>" in msg["extrainfo"]:
             xml = etree.fromstring(msg["extrainfo"])
             at_user = xml.xpath('string(/msgsource/atuserlist)')
             user_list = [user for user in at_user.split(",") if user]

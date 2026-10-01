@@ -4,13 +4,5 @@ build/*
 dist/*
 *.egg-info
 test*
-!tests/
-!tests/test_quote_self_image.py
-!tests/test_dbkey_priority.py
-!tests/test_voice_db_fallback.py
-!tests/test_media_retry_store.py
-!tests/test_media_retry_manager.py
-!tests/test_media_retry_integration.py
-!tests/test_msgprocess_animated_retry.py
 __pycache__*
 task
