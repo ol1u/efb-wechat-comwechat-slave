@@ -1577,8 +1577,18 @@ class ComWeChatChannel(SlaveChannel):
         dbkey_result = self.dbkey.query(db_name, sql)
         if dbkey_result is not None:
             return dbkey_result
+        get_db_handle = getattr(self.bot, "GetDBHandle", None)
+        if db_name and "db_handle" not in params and callable(get_db_handle):
+            # 新版 python-comwechatrobot-http: QueryDatabase 改为要求 db_handle
+            # (通过 GetDBHandle(db_name) 向 Hook 获取原生数据库句柄),
+            # 不再接受 db_name
+            try:
+                params["db_handle"] = get_db_handle(db_name)
+                params.pop("db_name", None)
+            except Exception as exc:
+                self.logger.warning("获取数据库句柄失败(db=%s): %r, 回退到旧式调用", db_name, exc)
         if db_name:
-            params["db_name"] = db_name
+            params.setdefault("db_name", db_name)
         if sql:
             params["sql"] = sql
         return self.bot.QueryDatabase(**params)
