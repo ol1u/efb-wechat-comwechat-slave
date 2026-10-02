@@ -110,6 +110,54 @@ def wechatimagedecode( file : str) -> tempfile:
         f.write(decode(magic, buf))
     return ret_file
 
+def compress_image_if_large(file, max_dim: int = 1280, quality: int = 75,
+                            size_threshold: int = 1024 * 1024):
+    """微信图片在上传 Telegram 前压缩,减少大图上传失败的概率。
+
+    - 文件小于 size_threshold 直接返回原文件,不动
+    - GIF 不动(保留动画)
+    - 其余按最长边 max_dim 等比缩放,转 JPEG(quality);PNG 透明部分垫白底
+    - 任何异常都返回原文件,绝不影响消息投递
+    """
+    logger = logging.getLogger("comwechat")
+    try:
+        file.seek(0, os.SEEK_END)
+        size = file.tell()
+        file.seek(0)
+        if size < size_threshold:
+            return file
+        from PIL import Image
+        img = Image.open(file.name)
+        if img.format == "GIF":
+            return file
+        w, h = img.size
+        if max(w, h) > max_dim:
+            ratio = max_dim / max(w, h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+        if img.mode in ("RGBA", "LA", "PA"):
+            bg = Image.new("RGB", img.size, (255, 255, 255))
+            bg.paste(img, mask=img.split()[-1])
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        out = tempfile.NamedTemporaryFile(suffix=".jpg")
+        img.save(out.name, "JPEG", quality=quality, optimize=True)
+        out.seek(0)
+        try:
+            file.close()  # 原解码临时文件不再需要,关闭即自动删除
+        except Exception:
+            pass
+        logger.info("图片过大已压缩: %.1fMB -> %.1fMB (%sx%s)",
+                    size / 1048576, os.path.getsize(out.name) / 1048576, w, h)
+        return out
+    except Exception:
+        logger.exception("图片压缩失败,使用原图")
+        try:
+            file.seek(0)
+        except Exception:
+            pass
+        return file
+
 def load_local_file_to_temp(file : str) -> tempfile:
     """
     从本地文件读取文件到临时文件

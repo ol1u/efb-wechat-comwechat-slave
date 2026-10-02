@@ -52,6 +52,8 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
 
     elif msg["type"] == "image":
         file = wechatimagedecode(msg["filepath"])
+        # 大图先压缩再上传 Telegram,减少上传失败概率;小图/GIF 原样
+        file = compress_image_if_large(file)
         return efb_image_wrapper(file)
 
     elif msg["type"] == "animatedsticker":
