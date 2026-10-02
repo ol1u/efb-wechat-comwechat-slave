@@ -819,8 +819,13 @@ class ComWeChatChannel(SlaveChannel):
             self.sent_msgs.pop(key, None)
             received_msgid = self.sent_msg_results.pop(key, None)
 
-        if not event_set:
-            self.logger.warning(f"Timed out waiting for sent message confirmation: {key}")
+        if not event_set or not received_msgid:
+            # 拿不到 msgid:这条消息的撤回/编辑将不可用,直接告警方便排查 hook 事件
+            self.logger.warning(
+                "[msgid-missing] 未收到 hook 的 sent_msg 回传(key=%s),"
+                "本条消息无法撤回/编辑。请检查 hook 是否正常推送 sent_msg 事件。",
+                key,
+            )
             return None
         return received_msgid
 
