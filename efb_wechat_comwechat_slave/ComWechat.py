@@ -193,10 +193,14 @@ class ComWeChatChannel(SlaveChannel):
         def update_contacts_wrapper(func):
             def wrapper(msg):
                 if self.wxid is None:
-                    if self.confirm_login():
-                        return func(msg)
-                else:
-                    return func(msg)
+                    self.confirm_login()
+                if self.wxid is None:
+                    # 仍未登录,丢弃并记日志。
+                    # 之前这里是 if self.confirm_login(): 结构,但 confirm_login()
+                    # 没有 return 语句永远返回 None,导致重启后第一条消息必被无声丢弃。
+                    self.logger.warning("登录确认失败,丢弃消息: type=%s", msg.get("type"))
+                    return
+                return func(msg)
             return wrapper
 
         @self.bot.on("self_msg")
