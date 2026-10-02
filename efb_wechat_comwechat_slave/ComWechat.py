@@ -658,6 +658,15 @@ class ComWeChatChannel(SlaveChannel):
 
         try:
             if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
+                # 诊断:share 消息先记录识别情况,便于排查表情包分流是否命中
+                if msg.get("type") == "share":
+                    try:
+                        self.logger.warning(
+                            "share 文件消息诊断: emoticon=%s cdnurl=%s xml头=%s",
+                            is_emoticon_share(msg), bool(emoticon_cdn_url(msg)),
+                            str(msg.get("message", ""))[:300].replace("\n", " "))
+                    except Exception:
+                        pass
                 # 表情包(share/appmsg type=8)实际走 CDN:有 cdnurl 就跳过延迟队列直接处理,
                 # 否则进延迟队列等本地文件必超时,表现为 [share 下载超时]
                 if is_emoticon_share(msg) and emoticon_cdn_url(msg):
