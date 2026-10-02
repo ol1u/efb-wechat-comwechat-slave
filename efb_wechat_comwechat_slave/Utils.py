@@ -2,6 +2,7 @@ import logging
 import tempfile
 import threading
 import time
+import base64
 import requests as requests
 import re
 import json
@@ -35,12 +36,39 @@ def is_emoticon_share(msg : dict) -> bool:
     if msg.get("type") != "share":
         return False
     text = str(msg.get("message", ""))
-    return "<appmsg>" in text and "<type>8</type>" in text
+    # 注意:appmsg 标签常带属性(<appmsg appid="" sdkver="0">),不能精确匹配 <appmsg>
+    return "<appmsg" in text and "<type>8</type>" in text
 
 def emoticon_cdn_url(msg : dict):
     """提取表情包 share 消息中的 CDN 链接,没有则返回 None。"""
     m = re.search("cdnurl\\s*=\\s*\"(.*?)\"", str(msg.get("message", "")))
     return m.group(1).replace("amp;", "") if m else None
+
+def emoticon_full_urls(msg : dict) -> list:
+    """从表情包 share 消息的 emojiinfo 中提取完整文件的 CDN 地址列表。
+
+    大表情包以加密文件形式传输,下载地址藏在 emojiinfo(base64 protobuf)里。
+    返回的 URL 按 m 参数与 emoticonmd5 的匹配度排序,匹配的优先。
+    注意:腾讯 CDN 可能有防盗链,直接下载可能被拒(400)。
+    """
+    text = str(msg.get("message", ""))
+    m = re.search(r"<emojiinfo>(.*?)</emojiinfo>", text, re.S)
+    if not m:
+        return []
+    try:
+        raw = base64.b64decode(m.group(1))
+    except Exception:
+        return []
+    urls = re.findall(
+        # 注意:URL 后可能紧跟 protobuf 二进制垃圾,故匹配到 &bizid=1022 即止,不校验后续字符
+        rb"http://vweixinf\.tc\.qq\.com/110/\d+/stodownload\?m=[0-9a-f]+&filekey=[0-9a-f]+(?:&[a-z]+=[\x20-\x7e]+?)?&bizid=1022",
+        raw)
+    uniq = list(dict.fromkeys(u.decode("ascii") for u in urls))
+    md5m = re.search(r"<emoticonmd5>(.*?)</emoticonmd5>", text)
+    md5 = md5m.group(1) if md5m else ""
+    if md5:
+        uniq.sort(key=lambda u: (f"m={md5}&" not in u, u))
+    return uniq
 
 def download_file(url: str, retry: int = 5, retry_interval: float = 5.0) -> tempfile:
     """

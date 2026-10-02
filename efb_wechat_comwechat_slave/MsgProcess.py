@@ -65,16 +65,23 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
             return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
 
     elif msg["type"] == "share":
-        # 表情包(share/appmsg type=8):走 CDN 下载并按动图发送,不当普通文件处理
+        # 表情包(share/appmsg type=8):依次尝试 CDN 通道,都不行则快速失败。
+        # 大表情包以加密文件形式传输且 CDN 有防盗链,本地文件也永不出现,
+        # 故不进 120 秒延迟等待,几秒内给出明确结果。
         if is_emoticon_share(msg):
-            try:
-                url = emoticon_cdn_url(msg)
-                if not url:
-                    raise ValueError("表情包 share 消息无 cdnurl")
-                file = download_file(url)
-                return efb_image_wrapper(file)
-            except:
-                return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
+            urls = []
+            cdn = emoticon_cdn_url(msg)
+            if cdn:
+                urls.append(cdn)
+            urls.extend(emoticon_full_urls(msg))
+            for url in urls:
+                try:
+                    # 防盗链时 1 秒内即 400,少次重试足够
+                    file = download_file(url, retry=2, retry_interval=1)
+                    return efb_image_wrapper(file)
+                except Exception:
+                    continue
+            return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
         if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
             file = load_local_file_to_temp(msg["filepath"])
             return efb_file_wrapper(file, os.path.basename(msg["filepath"]))
