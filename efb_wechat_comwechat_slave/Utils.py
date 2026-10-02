@@ -1,6 +1,7 @@
 import logging
 import tempfile
 import threading
+import time
 import requests as requests
 import re
 import json
@@ -25,11 +26,17 @@ def load_config(path : str) -> Dict[str, None]:
         config: Dict[str, Any] = d
     return config
 
-def download_file(url: str, retry: int = 3) -> tempfile:
+def download_file(url: str, retry: int = 5, retry_interval: float = 5.0) -> tempfile:
     """
-    A function that downloads files from given URL
+    从 URL 下载文件。相比原版更健壮:
+    - 检查 HTTP 状态码,404/403 等也抛异常走重试。
+      之前不检查,CDN 未同步时返回的错误页面会被当成正常图片,
+      导致表情包在 Telegram 侧无声丢失(连降级提示都没有)。
+    - 重试带间隔,应对微信 CDN 同步延迟(立即连试基本撞墙)。
+    - 返回前复位文件指针到开头。
     Remember to close the file once you are done with the file!
-    :param retry: The max retries before giving up
+    :param retry: 放弃前的最大尝试次数
+    :param retry_interval: 每次重试前的等待秒数
     :param url: The URL that points to the file
     """
     count = 1
@@ -37,16 +44,19 @@ def download_file(url: str, retry: int = 3) -> tempfile:
         try:
             file = tempfile.NamedTemporaryFile()
             r = requests.get(url, stream=True, timeout=10)
+            r.raise_for_status()
             for chunk in r.iter_content(chunk_size=1024):
                 if chunk:
                     file.write(chunk)
                     file.flush()
+            file.seek(0)
         except Exception as e:
-            logging.getLogger(__name__).warning(f"Error occurred when downloading {url}. {e}")
+            logging.getLogger(__name__).warning(f"Error occurred when downloading {url} (attempt {count}/{retry}). {e}")
             if count >= retry:
                 logging.getLogger(__name__).warning(f"Maximum retry reached. Giving up.")
                 raise e
             count += 1
+            time.sleep(retry_interval)
         else:
             break
     return file

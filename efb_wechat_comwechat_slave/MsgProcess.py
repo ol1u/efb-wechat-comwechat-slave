@@ -62,7 +62,7 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
             file = download_file(url)
             return efb_image_wrapper(file)
         except:
-            return efb_text_simple_wrapper("Image received and download failed. Please check it on your phone.")
+            return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
 
     elif msg["type"] == "share":
         if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
