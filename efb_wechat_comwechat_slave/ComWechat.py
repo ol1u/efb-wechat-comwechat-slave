@@ -1,6 +1,7 @@
 import logging, tempfile
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from lxml import etree
 from traceback import print_exc
 from pydub import AudioSegment
@@ -89,6 +90,13 @@ class ComWeChatChannel(SlaveChannel):
         self.bot = WeChatRobot(ip="0.0.0.0", port=23456, api_host=self.api_host, api_port=self.api_port)
 
         self.wxid = None
+        # 入站投递线程池:Hook 回调只做轻量投递,不在回调线程里阻塞。
+        # 避免某条消息处理中 hanging 时占住 Hook 线程,导致后续所有消息(包括文字)进不来。
+        self._inbound_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cw-inbound")
+        # 发往 master(最终调 Telegram 接口)的投递线程池,配合超时使用,超时即放弃不拖死流水线
+        self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
+        self._deliver_timeout = 60  # 单条消息投递超时(秒)
+        self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
         self.load()
         self.dir = self.config["dir"]
@@ -215,7 +223,7 @@ class ComWeChatChannel(SlaveChannel):
                     chat.vendor_specific = {'is_mp' : True}
                 author = chat.self
 
-            self.handle_msg(msg , author , chat)
+            self._dispatch_inbound(msg , author , chat)
 
         @self.bot.on("friend_msg")
         @update_contacts_wrapper
@@ -237,7 +245,7 @@ class ComWeChatChannel(SlaveChannel):
                 chat.vendor_specific = {'is_mp' : True}
                 self.logger.debug(f'modified_chat:{chat}')
             author = chat.other
-            self.handle_msg(msg, author, chat)
+            self._dispatch_inbound(msg, author, chat)
 
         @self.bot.on("group_msg")
         @update_contacts_wrapper
@@ -267,7 +275,7 @@ class ComWeChatChannel(SlaveChannel):
                 name = name,
                 alias = alias
             ))
-            self.handle_msg(msg, author, chat)
+            self._dispatch_inbound(msg, author, chat)
 
         @self.bot.on("revoke_msg")
         @update_contacts_wrapper
@@ -318,7 +326,7 @@ class ComWeChatChannel(SlaveChannel):
                             name= name,
                     ))
                     author = chat.other
-                    self.handle_msg(msg, author, chat)
+                    self._dispatch_inbound(msg, author, chat)
                     return
 
             content = {}
@@ -534,8 +542,7 @@ class ComWeChatChannel(SlaveChannel):
             self.wxid = None
             return "退出成功"
 
-    @staticmethod
-    def send_efb_msgs(efb_msgs: Union[Message, List[Message]], **kwargs):
+    def send_efb_msgs(self, efb_msgs: Union[Message, List[Message]], **kwargs):
         if not efb_msgs:
             return
         efb_msgs = [efb_msgs] if isinstance(efb_msgs, Message) else efb_msgs
@@ -544,9 +551,28 @@ class ComWeChatChannel(SlaveChannel):
         for efb_msg in efb_msgs:
             for k, v in kwargs.items():
                 setattr(efb_msg, k, v)
-            coordinator.send_message(efb_msg)
-            if efb_msg.file:
-                efb_msg.file.close()
+            # 投递到 master(最终调 Telegram 接口)可能因网络问题 hanging,
+            # 用超时隔离:超时即放弃该条并记 ERROR,不让它卡住整条流水线。
+            # 注意:极端情况下超时后后台线程仍可能投递成功,会产生一条重复消息,
+            # 这是为保住流水线而接受的代价,概率极低。
+            def _deliver(m):
+                try:
+                    coordinator.send_message(m)
+                finally:
+                    try:
+                        if m.file:
+                            m.file.close()
+                    except Exception:
+                        pass
+            future = self._deliver_executor.submit(_deliver, efb_msg)
+            try:
+                future.result(timeout=self._deliver_timeout)
+            except FuturesTimeoutError:
+                self.logger.error(
+                    "投递消息到 Telegram 超时(%ss),已跳过以保住流水线: type=%s uid=%s",
+                    self._deliver_timeout, getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
+            except Exception:
+                self.logger.exception("投递消息到 Telegram 异常: uid=%s", kwargs.get('uid'))
 
     def system_msg(self, content : Dict):
         self.logger.debug(f"system_msg:{content}")
@@ -575,6 +601,25 @@ class ComWeChatChannel(SlaveChannel):
             msg.target = content['target']
 
         self.send_efb_msgs(msg, uid=int(time.time()), chat=chat, author=author, type=MsgType.Text)
+
+    def _dispatch_inbound(self, msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
+        """Hook 回调的轻量投递入口:把耗时处理丢进线程池,回调线程立即返回。
+
+        之前回调里直接同步处理,某条消息 hanging 会占住 Hook 线程,
+        后续所有消息(包括文字消息)都进不来,表现为偶发漏消息。
+        """
+        try:
+            self._inbound_executor.submit(self._handle_msg_guarded, msg, author, chat)
+        except Exception:
+            self.logger.exception("入站消息投递到线程池失败: type=%s", msg.get("type"))
+
+    def _handle_msg_guarded(self, msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
+        try:
+            self.handle_msg(msg, author, chat)
+        except Exception:
+            # 毒消息(缺字段、结构异常等)不能无声丢失,记 ERROR 便于定位
+            self.logger.exception("处理入站消息失败,已丢弃: type=%s msgid=%s",
+                                  msg.get("type"), msg.get("msgid"))
 
     def handle_msg(self , msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
         emojiList = re.findall('\[[\w|！|!| ]+\]' , msg["message"])
@@ -623,23 +668,34 @@ class ComWeChatChannel(SlaveChannel):
             efb_msgs = MsgProcess(msg, chat)
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
-    def _file_is_stable(self, path: str, interval: float = 1.0) -> bool:
-        """文件存在且大小在 interval 秒内不再变化(下载完成),才算就绪。
+    def _drop_pending_file(self, path: str):
+        """从延迟队列移除一条文件消息,同时清理就绪探测状态。"""
+        self.file_msg.pop(path, None)
+        self._file_probe.pop(path, None)
 
-        避免读到 Hook 正在写入的半截文件导致图片解码失败。
+    def _file_is_stable(self, path: str, stable_secs: float = 2.0) -> bool:
+        """文件存在且大小连续 stable_secs 秒不再变化(下载完成),才算就绪。
+
+        用跨轮询的探测代替 time.sleep,避免单线程处理大量延迟文件时
+        被 sleep 串行拖慢,导致就绪的文件也要排长队。
         """
         try:
-            size1 = os.path.getsize(path)
+            size = os.path.getsize(path)
         except OSError:
+            self._file_probe.pop(path, None)
             return False
-        if size1 <= 0:
+        if size <= 0:
+            self._file_probe.pop(path, None)
             return False
-        time.sleep(interval)
-        try:
-            size2 = os.path.getsize(path)
-        except OSError:
+        now = time.time()
+        prev = self._file_probe.get(path)
+        if prev is None or prev[0] != size:
+            self._file_probe[path] = (size, now)
             return False
-        return size1 == size2
+        if now - prev[1] >= stable_secs:
+            self._file_probe.pop(path, None)
+            return True
+        return False
 
     def _deliver_pending_file(self, path: str):
         """处理一条延迟等待的文件消息,成功或降级后从队列移除。"""
@@ -652,7 +708,7 @@ class ComWeChatChannel(SlaveChannel):
             self.logger.warning("文件 %s 下载超时,降级为文本提示", path)
             msg['message'] = f"[{msg['type']} 下载超时,请在手机端查看]"
             msg["type"] = "text"
-            del self.file_msg[path]
+            self._drop_pending_file(path)
             self.send_efb_msgs(MsgWrapper(msg, MsgProcess(msg, chat)), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
             return
 
@@ -674,7 +730,7 @@ class ComWeChatChannel(SlaveChannel):
         if not (os.path.exists(path) and self._file_is_stable(path)):
             return
 
-        del self.file_msg[path]
+        self._drop_pending_file(path)
         try:
             efb_msgs = MsgProcess(msg, chat)
         except Exception:
@@ -693,10 +749,7 @@ class ComWeChatChannel(SlaveChannel):
                     except Exception:
                         # 单条消息异常不能拖死整个处理线程,否则后续所有延迟消息都收不到
                         self.logger.exception("处理延迟文件消息异常,已跳过: %s", path)
-                        try:
-                            del self.file_msg[path]
-                        except KeyError:
-                            pass
+                        self._drop_pending_file(path)
                 if len(self.delete_file):
                     for k in list(self.delete_file.keys()):
                         file_path = k
@@ -1071,6 +1124,12 @@ class ComWeChatChannel(SlaveChannel):
 
     def stop_polling(self):
         self.db.stop_worker()
+        for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None)):
+            if pool is not None:
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
 
     def get_message_by_id(self, chat: 'Chat', msg_id: MessageID) -> Optional['Message']:
         ...
