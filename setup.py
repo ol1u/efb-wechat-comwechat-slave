@@ -21,11 +21,17 @@ setup(
     python_requires='>=3.7',
     keywords=["wechat", ],
     install_requires=[
-        "python-comwechatrobot-http",
+        # 必须用 sddpljx 的 fork:支持 api_host/api_port 自定义 Hook 地址,
+        # PyPI 原版 1.0.1 没有这两个参数,会导致 WeChatRobot 初始化失败
+        "python-comwechatrobot-http @ git+https://github.com/sddpljx/python-comwechatrobot-http.git",
         "ehforwarderbot",
         "PyYaml>=5.3",
-        "cachetools",
+        # python-telegram-bot~=13.15 (efb-telegram-master 依赖) 钉死 cachetools==4.2.2,
+        # 不钉死的话 pip 会装 7.x,直接报 ContextualVersionConflict 起不来
+        "cachetools==4.2.2",
         "requests",
+        # 同上,PTB v13 需要 urllib3 v1(v2 删掉了 urllib3.contrib.appengine)
+        "urllib3<2",
         "peewee",
         "python-magic",
         "lxml",
