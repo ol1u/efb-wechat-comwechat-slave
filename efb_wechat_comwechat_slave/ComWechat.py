@@ -76,6 +76,7 @@ class ComWeChatChannel(SlaveChannel):
     self_update_lock = threading.Lock()
     contact_update_lock = threading.Lock()
     group_update_lock = threading.Lock()
+    file_lock_key = "__file_op__"  # 文件类发送的 _wait 关联键(移植自上游,用于撤回/编辑)
 
     def __init__(self, instance_id: InstanceID = None):
         super().__init__(instance_id=instance_id)
@@ -102,10 +103,9 @@ class ComWeChatChannel(SlaveChannel):
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
-        self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text, seq): Event} 等待 hook 回传 msgid
+        self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text): Event} 等待 hook 回传 msgid
         self.sent_msg_results: Dict[Any, MessageID] = {}
         self.pending_lock = threading.Lock()
-        self._send_seq = 0  # 发送序号,保证每个 _wait key 唯一,避免快速连发时后者覆盖前者
         self.revoke_message_ids = TTLCache(maxsize=200, ttl=max(self.time_out, 1))  # 防撤回回声
         self.send_timeout = self.config.get("send_timeout", 5)  # 等待 hook 回传 msgid 的超时(秒)
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
@@ -233,25 +233,18 @@ class ComWeChatChannel(SlaveChannel):
 
             key = None
             with self.pending_lock:
-                # 按注册顺序(FIFO)匹配最早的等待项。每个发送 key 都带唯一序号,
-                # 相同文本快速连发/多文件连发时不再互相覆盖,按 hook 回传顺序依次匹配。
-                # key 格式:(sender, content_or_None, seq),文件类发送的 content 为 None。
-                for k in list(self.sent_msgs.keys()):
-                    if not isinstance(k, tuple) or len(k) != 3:
-                        continue
-                    k_sender, k_content, _ = k
-                    if k_sender != sender:
-                        continue
-                    if filepath:
-                        if k_content is None:
-                            key = k
-                            break
-                    elif message_content:
-                        if k_content == message_content:
-                            key = k
-                            break
+                if message_content:
+                    potential_key_text = (sender, message_content)
+                    if potential_key_text in self.sent_msgs:
+                        key = potential_key_text
 
-                if key is not None:
+                if filepath:
+                    potential_key_file = (sender, None, self.file_lock_key)
+                    if potential_key_file in self.sent_msgs:
+                        key = potential_key_file
+                        self.logger.debug(f"Found pending file operation for key: {key}")
+
+                if key and key in self.sent_msgs:
                     event = self.sent_msgs[key]
                     self.sent_msg_results[key] = MessageID(str(msgid))
                     event.set()
@@ -812,12 +805,6 @@ class ComWeChatChannel(SlaveChannel):
             names = list(VOICE_DATABASE_NAMES)
         return sorted(set(names), key=lambda name: (len(name), name))
 
-    def _next_send_seq(self) -> int:
-        """分配发送序号,保证每个 _wait key 唯一。"""
-        with self.pending_lock:
-            self._send_seq += 1
-            return self._send_seq
-
     def _wait(self, key: Any, timeout: int) -> Optional[MessageID]:
         """等待 hook 回传指定 key 的微信 msgid(移植自上游,用于撤回/编辑)。"""
         event = self.sent_msgs.get(key)
@@ -1210,7 +1197,7 @@ class ComWeChatChannel(SlaveChannel):
                 img_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送图片路径: {img_path}")
-            file_key = (chat_uid, None, self._next_send_seq())
+            file_key = (chat_uid, None, self.file_lock_key)
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendImage(receiver = chat_uid , img_path = img_path)
@@ -1241,7 +1228,7 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, filename)
             
             self.logger.debug(f"发送文件路径: {file_path}")
-            file_key = (chat_uid, None, self._next_send_seq())
+            file_key = (chat_uid, None, self.file_lock_key)
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendFile(receiver = chat_uid , file_path = file_path)
@@ -1266,7 +1253,7 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送动画表情路径: {file_path}")
-            file_key = (chat_uid, None, self._next_send_seq())
+            file_key = (chat_uid, None, self.file_lock_key)
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendEmotion(wxid = chat_uid , img_path = file_path)
@@ -1343,12 +1330,12 @@ class ComWeChatChannel(SlaveChannel):
                         else:
                             content = "<content />"
                         xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                        key = (wxid, xml, self._next_send_seq())
+                        key = (wxid, xml)
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
                         self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
                         return self._wait(key, self.send_timeout)
-        key = (wxid, text, self._next_send_seq())
+        key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
         self.bot.SendText(wxid = wxid , msg = text)
