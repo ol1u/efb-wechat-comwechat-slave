@@ -571,6 +571,23 @@ class ComWeChatChannel(SlaveChannel):
                 self.logger.error(
                     "投递消息到 Telegram 超时(%ss),已跳过以保住流水线: type=%s uid=%s",
                     self._deliver_timeout, getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
+                # 尽力而为:补一条超时提示,避免用户侧无声丢失。
+                # 提示本身也走同样的超时投递,若网络已断则发不出,仅记日志。
+                # _is_timeout_notice 防止提示的投递再超时时无限递归。
+                if not kwargs.get('_is_timeout_notice'):
+                    try:
+                        notice = Message()
+                        notice.text = "[消息投递超时,请在手机端查看]"
+                        self.send_efb_msgs(
+                            notice,
+                            uid=f"{kwargs.get('uid')}-timeout",
+                            chat=kwargs.get('chat'),
+                            author=kwargs.get('author'),
+                            type=MsgType.Text,
+                            _is_timeout_notice=True,
+                        )
+                    except Exception:
+                        self.logger.exception("发送投递超时提示失败")
             except Exception:
                 self.logger.exception("投递消息到 Telegram 异常: uid=%s", kwargs.get('uid'))
 
