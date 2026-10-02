@@ -1277,43 +1277,55 @@ class ComWeChatChannel(SlaveChannel):
                     qt_txt = msg.target.text or msg.target.type.name
                     text = qutoed_text(qt_txt, msg.text)
                 else:
-                    msgid = msg.target.uid
-                    sender = msg.target.author.uid
-                    displayname = self.group_members.get(wxid,{}).get(sender, self.get_nickname_by_wxid(sender))
-                    content = escape(msg.target.vendor_specific.get("wx_xml", ""), {
-                        "\n": "&#x0A;",
-                        "\t": "&#x09;",
-                        '"': "&quot;",
-                    }) or msg.target.text
-                    comwechat_info = msg.target.vendor_specific.get("comwechat_info", {})
-                    if comwechat_info.get("type", None) == "animatedsticker":
-                        refer_type = 47
-                    elif msg.target.type == MsgType.Image:
-                        refer_type = 3
-                    elif msg.target.type == MsgType.Voice:
-                        refer_type = 34
-                    elif msg.target.type == MsgType.Video:
-                        refer_type = 43
-                    elif msg.target.type == MsgType.Sticker:
-                        refer_type = 47
-                    elif msg.target.type == MsgType.Location:
-                        refer_type = 48
-                    elif msg.target.type == MsgType.File:
-                        refer_type = 49
-                    elif comwechat_info.get("type", None) == "share":
-                        refer_type = 49
+                    # 取第一个有效的微信 msgid;没有则降级为文本引用,避免拼出坏 XML
+                    # (移植自上游 c1c7bae 思想:引用目标无有效 msgid 时不硬拼)
+                    target_msgid = next(
+                        (item for item in load_message_ids(msg.target.uid or "") if item.isdecimal()),
+                        None,
+                    )
+                    if target_msgid is None:
+                        self.logger.debug(
+                            "引用目标无有效微信 msgid,降级为文本引用: uid=%s", msg.target.uid)
+                        qt_txt = msg.target.text or msg.target.type.name
+                        text = qutoed_text(qt_txt, msg.text)
                     else:
-                        refer_type = 1
-                    if content:
-                        content = "<content>%s</content>" % content
-                    else:
-                        content = "<content />"
-                    xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                    key = (wxid, xml)
-                    with self.pending_lock:
-                        self.sent_msgs[key] = threading.Event()
-                    self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
-                    return self._wait(key, self.send_timeout)
+                        msgid = target_msgid
+                        sender = msg.target.author.uid
+                        displayname = self.group_members.get(wxid,{}).get(sender, self.get_nickname_by_wxid(sender))
+                        content = escape(msg.target.vendor_specific.get("wx_xml", ""), {
+                            "\n": "&#x0A;",
+                            "\t": "&#x09;",
+                            '"': "&quot;",
+                        }) or msg.target.text
+                        comwechat_info = msg.target.vendor_specific.get("comwechat_info", {})
+                        if comwechat_info.get("type", None) == "animatedsticker":
+                            refer_type = 47
+                        elif msg.target.type == MsgType.Image:
+                            refer_type = 3
+                        elif msg.target.type == MsgType.Voice:
+                            refer_type = 34
+                        elif msg.target.type == MsgType.Video:
+                            refer_type = 43
+                        elif msg.target.type == MsgType.Sticker:
+                            refer_type = 47
+                        elif msg.target.type == MsgType.Location:
+                            refer_type = 48
+                        elif msg.target.type == MsgType.File:
+                            refer_type = 49
+                        elif comwechat_info.get("type", None) == "share":
+                            refer_type = 49
+                        else:
+                            refer_type = 1
+                        if content:
+                            content = "<content>%s</content>" % content
+                        else:
+                            content = "<content />"
+                        xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
+                        key = (wxid, xml)
+                        with self.pending_lock:
+                            self.sent_msgs[key] = threading.Event()
+                        self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+                        return self._wait(key, self.send_timeout)
         key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
