@@ -76,7 +76,6 @@ class ComWeChatChannel(SlaveChannel):
     self_update_lock = threading.Lock()
     contact_update_lock = threading.Lock()
     group_update_lock = threading.Lock()
-    file_lock_key = "__file_op__"  # 文件类发送的 _wait 关联键(移植自上游,用于撤回/编辑)
 
     def __init__(self, instance_id: InstanceID = None):
         super().__init__(instance_id=instance_id)
@@ -100,12 +99,17 @@ class ComWeChatChannel(SlaveChannel):
         # 发往 master(最终调 Telegram 接口)的投递线程池,配合超时使用,超时即放弃不拖死流水线
         self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
+        # 语音查库执行器:查库是调 hook 的 HTTP 接口,hook 卡住时不能拖死
+        # 单线程的延迟文件队列,故隔离到独立线程并加超时。
+        self._voice_db_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cw-voicedb")
+        self._voice_db_timeout = 15  # 单次语音查库超时(秒)
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
-        self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text): Event} 等待 hook 回传 msgid
+        self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text, seq): Event} 等待 hook 回传 msgid
         self.sent_msg_results: Dict[Any, MessageID] = {}
         self.pending_lock = threading.Lock()
+        self._send_seq = 0  # 发送序号,保证每个 _wait key 唯一,避免快速连发时后者覆盖前者
         self.revoke_message_ids = TTLCache(maxsize=200, ttl=max(self.time_out, 1))  # 防撤回回声
         self.send_timeout = self.config.get("send_timeout", 5)  # 等待 hook 回传 msgid 的超时(秒)
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
@@ -233,18 +237,25 @@ class ComWeChatChannel(SlaveChannel):
 
             key = None
             with self.pending_lock:
-                if message_content:
-                    potential_key_text = (sender, message_content)
-                    if potential_key_text in self.sent_msgs:
-                        key = potential_key_text
+                # 按注册顺序(FIFO)匹配最早的等待项。每个发送 key 都带唯一序号,
+                # 相同文本快速连发/多文件连发时不再互相覆盖,按 hook 回传顺序依次匹配。
+                # key 格式:(sender, content_or_None, seq),文件类发送的 content 为 None。
+                for k in list(self.sent_msgs.keys()):
+                    if not isinstance(k, tuple) or len(k) != 3:
+                        continue
+                    k_sender, k_content, _ = k
+                    if k_sender != sender:
+                        continue
+                    if filepath:
+                        if k_content is None:
+                            key = k
+                            break
+                    elif message_content:
+                        if k_content == message_content:
+                            key = k
+                            break
 
-                if filepath:
-                    potential_key_file = (sender, None, self.file_lock_key)
-                    if potential_key_file in self.sent_msgs:
-                        key = potential_key_file
-                        self.logger.debug(f"Found pending file operation for key: {key}")
-
-                if key and key in self.sent_msgs:
+                if key is not None:
                     event = self.sent_msgs[key]
                     self.sent_msg_results[key] = MessageID(str(msgid))
                     event.set()
@@ -733,7 +744,21 @@ class ComWeChatChannel(SlaveChannel):
             ...
 
         if msg["type"] == "voice":
-            file_path = re.search("clientmsgid=\"(.*?)\"", msg["message"]).group(1) + ".amr"
+            try:
+                clientmsgid_match = re.search("clientmsgid=\"(.*?)\"", msg["message"])
+                if not clientmsgid_match:
+                    raise ValueError("语音消息中未找到 clientmsgid")
+                file_path = clientmsgid_match.group(1) + ".amr"
+            except Exception:
+                # 取不到 clientmsgid 时降级为文本提示,不能整条丢弃
+                self.logger.exception("语音消息解析 clientmsgid 失败,降级为文本提示: msgid=%s",
+                                      msg.get("msgid"))
+                msg['message'] = "[语音消息解析失败,请在手机端查看]"
+                msg["type"] = "text"
+                efb_msgs = MsgProcess(msg, chat)
+                self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat,
+                                   uid=MessageID(str(msg['msgid'])))
+                return
             msg["timestamp"] = int(time.time())
             msg["filepath"] = f'''{self.dir}{msg["self"]}/{file_path}'''
             self.file_msg[msg["filepath"]] = ( msg , author , chat )
@@ -805,6 +830,12 @@ class ComWeChatChannel(SlaveChannel):
             names = list(VOICE_DATABASE_NAMES)
         return sorted(set(names), key=lambda name: (len(name), name))
 
+    def _next_send_seq(self) -> int:
+        """分配发送序号,保证每个 _wait key 唯一。"""
+        with self.pending_lock:
+            self._send_seq += 1
+            return self._send_seq
+
     def _wait(self, key: Any, timeout: int) -> Optional[MessageID]:
         """等待 hook 回传指定 key 的微信 msgid(移植自上游,用于撤回/编辑)。"""
         event = self.sent_msgs.get(key)
@@ -846,33 +877,11 @@ class ComWeChatChannel(SlaveChannel):
 
         # 语音:文件未出现时尝试从数据库提取音频数据,轮询全部 MediaMSG 分片
         # (移植自上游 b278d27:之前写死只查 MediaMSG0.db,语音在别的分片就取不到)
+        # 查库走独立线程+超时:hook 卡住时只跳过本轮,不拖死整个延迟文件队列。
         if msg["type"] == "voice" and not os.path.exists(path):
-            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
-            database_names = self._voice_database_names()
-            filebuffer = None
-            for attempt in range(2):
-                for db_name in database_names:
-                    try:
-                        dbresult = self.bot.QueryDatabase(
-                            db_handle=self.bot.GetDBHandle(db_name), sql=sql)["data"]
-                    except Exception:
-                        continue  # 该分片不存在或查询失败,换下一个分片
-                    if len(dbresult) == 2:
-                        filebuffer = dbresult[1][0]
-                        break
-                if filebuffer is not None:
-                    break
-                if attempt == 0:
-                    # 第一轮都没查到:清分片缓存,刷新列表再试一轮
-                    self._voice_db_names = None
-                    try:
-                        self.bot.invalidate_db_handles()
-                    except Exception:
-                        pass  # hook 无此接口时忽略
-                    database_names = self._voice_database_names(refresh=True)
+            filebuffer = self._query_voice_buffer(msg["msgid"])
             if filebuffer is None:
-                self.logger.debug("语音数据在 %s 均未查到,继续等待文件: %s",
-                                  ",".join(database_names), path)
+                self.logger.debug("语音数据未查到,继续等待文件: %s", path)
                 return
             try:
                 decoded = bytes(base64.b64decode(filebuffer))
@@ -881,6 +890,41 @@ class ComWeChatChannel(SlaveChannel):
             except Exception:
                 self.logger.exception("语音数据解码/写入失败,继续等待文件: %s", path)
                 return
+
+    def _query_voice_buffer(self, msgid) -> Optional[bytes]:
+        """从 ComWeChat 数据库查语音 Buf,带超时。超时/异常返回 None,调用方继续等文件。"""
+        def _query():
+            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msgid}'
+            database_names = self._voice_database_names()
+            for attempt in range(2):
+                for db_name in database_names:
+                    try:
+                        dbresult = self.bot.QueryDatabase(
+                            db_handle=self.bot.GetDBHandle(db_name), sql=sql)["data"]
+                    except Exception:
+                        continue  # 该分片不存在或查询失败,换下一个分片
+                    if len(dbresult) == 2:
+                        return dbresult[1][0]
+                if attempt == 0:
+                    # 第一轮都没查到:清分片缓存,刷新列表再试一轮
+                    self._voice_db_names = None
+                    try:
+                        self.bot.invalidate_db_handles()
+                    except Exception:
+                        pass  # hook 无此接口时忽略
+                    database_names = self._voice_database_names(refresh=True)
+            return None
+
+        future = self._voice_db_executor.submit(_query)
+        try:
+            return future.result(timeout=self._voice_db_timeout)
+        except FuturesTimeoutError:
+            self.logger.warning("语音查库超时(%ss),跳过本轮继续等待文件: msgid=%s",
+                                self._voice_db_timeout, msgid)
+            return None
+        except Exception:
+            self.logger.exception("语音查库异常,继续等待文件: msgid=%s", msgid)
+            return None
 
         # 文件就绪且稳定才处理,避免读到下载中的半截文件
         if not (os.path.exists(path) and self._file_is_stable(path)):
@@ -1052,8 +1096,14 @@ class ComWeChatChannel(SlaveChannel):
                 return msg
 
         if msg.type == MsgType.Voice:
-            f = tempfile.NamedTemporaryFile(prefix='voice_message_', suffix=".mp3")
-            AudioSegment.from_ogg(msg.file.name).export(f, format="mp3")
+            try:
+                f = tempfile.NamedTemporaryFile(prefix='voice_message_', suffix=".mp3")
+                AudioSegment.from_ogg(msg.file.name).export(f, format="mp3")
+            except Exception:
+                # ogg 损坏/格式异常时之前直接抛异常,整条发送失败且提示含糊。
+                # 改为明确报错,让用户在 TG 看到原因。
+                self.logger.exception("TG 语音转码 mp3 失败")
+                raise EFBMessageError("语音转码失败,请在手机端确认")
             msg.file = f
             msg.file.name = "语音留言.mp3"
             msg.type = MsgType.Video
@@ -1191,7 +1241,7 @@ class ComWeChatChannel(SlaveChannel):
                 img_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送图片路径: {img_path}")
-            file_key = (chat_uid, None, self.file_lock_key)
+            file_key = (chat_uid, None, self._next_send_seq())
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendImage(receiver = chat_uid , img_path = img_path)
@@ -1222,7 +1272,7 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, filename)
             
             self.logger.debug(f"发送文件路径: {file_path}")
-            file_key = (chat_uid, None, self.file_lock_key)
+            file_key = (chat_uid, None, self._next_send_seq())
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendFile(receiver = chat_uid , file_path = file_path)
@@ -1247,7 +1297,7 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送动画表情路径: {file_path}")
-            file_key = (chat_uid, None, self.file_lock_key)
+            file_key = (chat_uid, None, self._next_send_seq())
             with self.pending_lock:
                 self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendEmotion(wxid = chat_uid , img_path = file_path)
@@ -1258,11 +1308,14 @@ class ComWeChatChannel(SlaveChannel):
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
 
+        # 发送失败必须抛给 ETM,让用户在 TG 看到提示。
+        # 注意:之前写成 try 里 raise、except 里吞掉,失败时用户毫无感知。
         try:
-            if str(res["msg"]) == "0":
-                raise EFBMessageError("发送失败，请在手机端确认")
-        except:
-            ...
+            send_failed = str(res["msg"]) == "0"
+        except Exception:
+            send_failed = False  # res 结构异常时不误判,保持原有容错行为
+        if send_failed:
+            raise EFBMessageError("发送失败，请在手机端确认")
         # 保存微信 msgid 供撤回/编辑用(移植自上游)
         if msg_ids:
             msg.uid = dump_message_ids(msg_ids)
@@ -1321,12 +1374,12 @@ class ComWeChatChannel(SlaveChannel):
                         else:
                             content = "<content />"
                         xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                        key = (wxid, xml)
+                        key = (wxid, xml, self._next_send_seq())
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
                         self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
                         return self._wait(key, self.send_timeout)
-        key = (wxid, text)
+        key = (wxid, text, self._next_send_seq())
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
         self.bot.SendText(wxid = wxid , msg = text)
@@ -1413,7 +1466,8 @@ class ComWeChatChannel(SlaveChannel):
         return None
     def stop_polling(self):
         self.db.stop_worker()
-        for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None)):
+        for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None),
+                     getattr(self, "_voice_db_executor", None)):
             if pool is not None:
                 try:
                     pool.shutdown(wait=False, cancel_futures=True)
