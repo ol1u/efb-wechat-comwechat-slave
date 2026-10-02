@@ -26,7 +26,7 @@ from . import __version__ as version
 from ehforwarderbot.channel import SlaveChannel
 from ehforwarderbot.types import MessageID, ChatID, InstanceID
 from ehforwarderbot import utils as efb_utils
-from ehforwarderbot.exceptions import EFBException, EFBChatNotFound, EFBMessageError
+from ehforwarderbot.exceptions import EFBException, EFBChatNotFound, EFBMessageError, EFBOperationNotSupported
 from ehforwarderbot.message import MessageCommand, MessageCommands
 from ehforwarderbot.status import MessageRemoval, ChatUpdates
 
@@ -34,7 +34,7 @@ from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
 from .MsgDeco import qutoed_text
 from .MsgProcess import MsgProcess, MsgWrapper
-from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls
+from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference
 from .db import DatabaseManager
 from .Constant import QUOTE_MESSAGE
 
@@ -76,6 +76,7 @@ class ComWeChatChannel(SlaveChannel):
     self_update_lock = threading.Lock()
     contact_update_lock = threading.Lock()
     group_update_lock = threading.Lock()
+    file_lock_key = "__file_op__"  # 文件类发送的 _wait 关联键(移植自上游,用于撤回/编辑)
 
     def __init__(self, instance_id: InstanceID = None):
         super().__init__(instance_id=instance_id)
@@ -101,6 +102,12 @@ class ComWeChatChannel(SlaveChannel):
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
+        # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
+        self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text): Event} 等待 hook 回传 msgid
+        self.sent_msg_results: Dict[Any, MessageID] = {}
+        self.pending_lock = threading.Lock()
+        self.revoke_message_ids = TTLCache(maxsize=200, ttl=max(self.time_out, 1))  # 防撤回回声
+        self.send_timeout = self.config.get("send_timeout", 5)  # 等待 hook 回传 msgid 的超时(秒)
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
         self.load()
         self.dir = self.config["dir"]
@@ -206,6 +213,44 @@ class ComWeChatChannel(SlaveChannel):
                     return
                 return func(msg)
             return wrapper
+
+        @self.bot.on("sent_msg")
+        def on_sent_msg(msg: Dict):
+            """hook 回传已发送消息的微信 msgid,唤醒 _wait(移植自上游,用于撤回/编辑)。"""
+            self.logger.debug(f"on_sent_msg received: {msg}")
+            sender: str = msg.get("sender")
+            msgid = msg.get("msgid")
+            message_content = msg.get("message")
+            filepath = msg.get("filepath")
+
+            if not sender or not msgid:
+                self.logger.warning("on_sent_msg missing sender or msgid.")
+                return
+
+            if msgid in self.cache:
+                self.logger.warning("self msg due to bug from upstream.")
+                return
+
+            key = None
+            with self.pending_lock:
+                if message_content:
+                    potential_key_text = (sender, message_content)
+                    if potential_key_text in self.sent_msgs:
+                        key = potential_key_text
+
+                if filepath:
+                    potential_key_file = (sender, None, self.file_lock_key)
+                    if potential_key_file in self.sent_msgs:
+                        key = potential_key_file
+                        self.logger.debug(f"Found pending file operation for key: {key}")
+
+                if key and key in self.sent_msgs:
+                    event = self.sent_msgs[key]
+                    self.sent_msg_results[key] = MessageID(str(msgid))
+                    event.set()
+                    self.logger.debug(f"Matched sent message {key} with msgid {msgid}. Signaled event.")
+                else:
+                    self.logger.debug(f"No pending message found matching sender {sender}.")
 
         @self.bot.on("self_msg")
         @update_contacts_wrapper
@@ -313,7 +358,12 @@ class ComWeChatChannel(SlaveChannel):
                     name = name,
                 ))
 
-            newmsgid = re.search("<newmsgid>(.*?)<\/newmsgid>", msg["message"]).group(1)
+            newmsgid = MessageID(re.search("<newmsgid>(.*?)<\/newmsgid>", msg["message"]).group(1))
+
+            # 防回声:自己从 TG 发起撤回后,微信会回一个撤回通知,直接忽略(移植自上游 a847ad3)
+            if self.revoke_message_ids.get(newmsgid):
+                self.logger.debug("Ignoring revoke feedback for server msgid %s", newmsgid)
+                return
 
             efb_msg = Message(chat = chat , uid = newmsgid)
             coordinator.send_status(
@@ -755,6 +805,25 @@ class ComWeChatChannel(SlaveChannel):
             names = list(VOICE_DATABASE_NAMES)
         return sorted(set(names), key=lambda name: (len(name), name))
 
+    def _wait(self, key: Any, timeout: int) -> Optional[MessageID]:
+        """等待 hook 回传指定 key 的微信 msgid(移植自上游,用于撤回/编辑)。"""
+        event = self.sent_msgs.get(key)
+        if not event:
+            self.logger.error(f"No event found for key {key} before waiting.")
+            return None
+
+        self.logger.debug(f"Waiting for event for key: {key} with timeout {timeout}s")
+        event_set = event.wait(timeout=timeout)
+
+        with self.pending_lock:
+            self.sent_msgs.pop(key, None)
+            received_msgid = self.sent_msg_results.pop(key, None)
+
+        if not event_set:
+            self.logger.warning(f"Timed out waiting for sent message confirmation: {key}")
+            return None
+        return received_msgid
+
     def _deliver_pending_file(self, path: str):
         """处理一条延迟等待的文件消息,成功或降级后从队列移除。"""
         msg = self.file_msg[path][0]
@@ -907,9 +976,52 @@ class ComWeChatChannel(SlaveChannel):
     #发送消息
     def send_message(self, msg : Message) -> Message:
         chat_uid = msg.chat.uid
+        msg_ids: List[MessageID] = []  # 收集微信 msgid,写回 msg.uid 供撤回/编辑用(移植自上游)
 
+        # TG 编辑消息 -> 微信:无原生编辑,用撤回+重发模拟(移植自上游 aca50dc)
         if msg.edit:
-            pass     # todo
+            if (msg.text or "").startswith("/"):
+                raise EFBMessageError("不支持编辑命令消息")
+
+            references = list(dict.fromkeys(load_message_ids(msg.uid))) if msg.uid else []
+            if not references:
+                raise EFBMessageError("编辑消息缺少有效的消息 ID")
+            invalid_reference = next(
+                (reference for reference in references if not is_message_reference(reference)),
+                None,
+            )
+            if invalid_reference:
+                raise EFBMessageError(f"无效的消息 ID: {invalid_reference}")
+
+            if not msg.edit_media and msg.type in (
+                MsgType.Voice,
+                MsgType.Image,
+                MsgType.File,
+                MsgType.Video,
+                MsgType.Animation,
+                MsgType.Sticker,
+            ):
+                # 只改了配文、媒体没换:撤回旧配文 -> 重发文字 -> 更新 uid
+                media_reference = references[0]
+                caption_references = references[1:]
+                if caption_references:
+                    caption = Message(
+                        chat=msg.chat,
+                        uid=dump_message_ids(caption_references),
+                    )
+                    self.send_status(MessageRemoval(self, self, caption))
+                if msg.text:
+                    caption_reference = self.send_text(chat_uid, msg)
+                    if caption_reference is None:
+                        raise EFBMessageError("发送失败，请在手机端确认")
+                    msg.uid = dump_message_ids([media_reference, caption_reference])
+                else:
+                    msg.uid = media_reference
+                return msg
+
+            # 其他情况:先撤回原微信消息,再走正常流程重发
+            self.send_status(MessageRemoval(self, self, msg))
+            msg.edit = False
 
         if self.wxid is None:
             if self.is_login():
@@ -1053,9 +1165,14 @@ class ComWeChatChannel(SlaveChannel):
                 else:
                     self.bot.SendText(wxid = chat_uid , msg = msg.text)
             else:
-                res = self.send_text(wxid = chat_uid , msg = msg)
+                text_msgid = self.send_text(wxid = chat_uid , msg = msg)
+                if text_msgid:
+                    msg_ids.append(text_msgid)
+                res = {"msg": "1" if text_msgid else "0"}
         elif msg.type in [MsgType.Link]:
-            self.send_text(wxid = chat_uid , msg = msg)
+            link_msgid = self.send_text(wxid = chat_uid , msg = msg)
+            if link_msgid:
+                msg_ids.append(link_msgid)
         elif msg.type in [MsgType.Image , MsgType.Sticker]:
             name = os.path.basename(msg.file.name)
             local_path = f"{self.dir}{self.wxid}/{name}"
@@ -1069,7 +1186,13 @@ class ComWeChatChannel(SlaveChannel):
                 img_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送图片路径: {img_path}")
+            file_key = (chat_uid, None, self.file_lock_key)
+            with self.pending_lock:
+                self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendImage(receiver = chat_uid , img_path = img_path)
+            media_msgid = self._wait(file_key, self.send_timeout)
+            if media_msgid:
+                msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
@@ -1094,7 +1217,13 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, filename)
             
             self.logger.debug(f"发送文件路径: {file_path}")
+            file_key = (chat_uid, None, self.file_lock_key)
+            with self.pending_lock:
+                self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendFile(receiver = chat_uid , file_path = file_path)
+            media_msgid = self._wait(file_key, self.send_timeout)
+            if media_msgid:
+                msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
@@ -1113,7 +1242,13 @@ class ComWeChatChannel(SlaveChannel):
                 file_path = os.path.join(self.base_path, self.wxid, name)
             
             self.logger.debug(f"发送动画表情路径: {file_path}")
+            file_key = (chat_uid, None, self.file_lock_key)
+            with self.pending_lock:
+                self.sent_msgs[file_key] = threading.Event()
             res = self.bot.SendEmotion(wxid = chat_uid , img_path = file_path)
+            media_msgid = self._wait(file_key, self.send_timeout)
+            if media_msgid:
+                msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
@@ -1123,9 +1258,14 @@ class ComWeChatChannel(SlaveChannel):
                 raise EFBMessageError("发送失败，请在手机端确认")
         except:
             ...
+        # 保存微信 msgid 供撤回/编辑用(移植自上游)
+        if msg_ids:
+            msg.uid = dump_message_ids(msg_ids)
         return msg
 
-    def send_text(self, wxid: ChatID, msg: Message) -> 'Message':
+    def send_text(self, wxid: ChatID, msg: Message) -> Optional[MessageID]:
+        """发送文本并等待 hook 回传微信 msgid(移植自上游,用于撤回/编辑)。
+        返回微信服务器 msgid,超时/失败返回 None。"""
         text = msg.text
         if isinstance(msg.target, Message):
                 if isinstance(msg.target.author, SelfChatMember) and isinstance(msg.target.deliver_to, SlaveChannel):
@@ -1164,8 +1304,16 @@ class ComWeChatChannel(SlaveChannel):
                     else:
                         content = "<content />"
                     xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                    return self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
-        return self.bot.SendText(wxid = wxid , msg = text)
+                    key = (wxid, xml)
+                    with self.pending_lock:
+                        self.sent_msgs[key] = threading.Event()
+                    self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+                    return self._wait(key, self.send_timeout)
+        key = (wxid, text)
+        with self.pending_lock:
+            self.sent_msgs[key] = threading.Event()
+        self.bot.SendText(wxid = wxid , msg = text)
+        return self._wait(key, self.send_timeout)
 
     def get_chat_picture(self, chat: 'Chat') -> BinaryIO:
         wxid = chat.uid
@@ -1202,8 +1350,50 @@ class ComWeChatChannel(SlaveChannel):
         t.start()
 
     def send_status(self, status: 'Status'):
-        ...
+        # TG 删消息 -> 撤回微信消息(移植自上游 a847ad3)
+        if not isinstance(status, MessageRemoval):
+            raise EFBOperationNotSupported()
 
+        message = status.message
+        references = list(dict.fromkeys(load_message_ids(message.uid)))
+        chat_uid = str(message.chat.uid)
+        if not references:
+            raise EFBMessageError("撤回消息缺少有效的消息 ID")
+
+        failures = []
+        for server_msgid in references:
+            if not server_msgid.isdecimal():
+                raise EFBMessageError(f"无效的消息 ID: {server_msgid}")
+
+            self.revoke_message_ids[server_msgid] = True
+            try:
+                response = self.bot.RevokeMessage(
+                    wxid=chat_uid,
+                    msgid=server_msgid,
+                )
+            except Exception as exc:
+                self.revoke_message_ids.pop(server_msgid, None)
+                failures.append(str(exc))
+                continue
+
+            reason = self._revoke_failure_reason(response)
+            if reason is not None:
+                self.revoke_message_ids.pop(server_msgid, None)
+                failures.append(reason)
+
+        if failures:
+            reason = "; ".join(failures)
+            if len(failures) == len(references):
+                raise EFBMessageError(f"消息撤回失败：{reason}")
+            raise EFBMessageError(f"部分消息撤回失败：{reason}")
+
+    @staticmethod
+    def _revoke_failure_reason(response: Any) -> Optional[str]:
+        if isinstance(response, dict) and response.get("result") == "OK" and "msg" not in response:
+            return "上游不支持撤回消息"
+        if not isinstance(response, dict) or str(response.get("msg")) != "1":
+            return response.get("err_msg") if isinstance(response, dict) else response
+        return None
     def stop_polling(self):
         self.db.stop_worker()
         for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None)):

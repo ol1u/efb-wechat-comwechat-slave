@@ -8,6 +8,7 @@ import re
 import json
 import yaml
 from typing import Dict , Any
+from ehforwarderbot.types import MessageID
 import pilk
 import pydub
 import os
@@ -372,3 +373,24 @@ WC_EMOTICON_CONVERSION = {
     '[生病]': '😷', '[Sick]': '😷',
     '[笑脸]': '😁', '[Happy]': '😁',
 }
+
+# 微信消息 ID 序列化/反序列化(移植自上游,用于撤回/编辑时定位微信侧消息)
+def dump_message_ids(ids: list) -> MessageID:
+    return MessageID(",".join(str(i) for i in ids))
+
+def load_message_ids(id: MessageID) -> list:
+    return [MessageID(item) for item in str(id).split(",") if item]
+
+def is_message_reference(value: MessageID) -> bool:
+    reference = str(value)
+    if reference.isdecimal():
+        return int(reference) > 0
+    parts = reference.split(":")
+    return (
+        len(parts) == 3
+        and parts[0] == "local"
+        and parts[1].isdecimal()
+        and int(parts[1]) > 0
+        and parts[2].isdecimal()
+        and int(parts[2]) > 0
+    )

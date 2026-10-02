@@ -23,7 +23,7 @@ setup(
     install_requires=[
         # 必须用 sddpljx 的 fork:支持 api_host/api_port 自定义 Hook 地址,
         # PyPI 原版 1.0.1 没有这两个参数,会导致 WeChatRobot 初始化失败
-        "python-comwechatrobot-http @ git+https://github.com/sddpljx/python-comwechatrobot-http.git",
+        "python-comwechatrobot-http @ git+https://github.com/ol1u/python-comwechatrobot-http.git",
         "ehforwarderbot",
         "PyYaml>=5.3",
         # python-telegram-bot~=13.15 (efb-telegram-master 依赖) 钉死 cachetools==4.2.2,
