@@ -34,7 +34,7 @@ from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
 from .MsgDeco import qutoed_text
 from .MsgProcess import MsgProcess, MsgWrapper
-from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION
+from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url
 from .db import DatabaseManager
 from .Constant import QUOTE_MESSAGE
 
@@ -658,11 +658,16 @@ class ComWeChatChannel(SlaveChannel):
 
         try:
             if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
-                msg["timestamp"] = int(time.time())
-                msg["filepath"] = msg["filepath"].replace("\\","/")
-                msg["filepath"] = f'''{self.dir}{msg["filepath"]}'''
-                self.file_msg[msg["filepath"]] = ( msg , author , chat )
-                return
+                # 表情包(share/appmsg type=8)实际走 CDN:有 cdnurl 就跳过延迟队列直接处理,
+                # 否则进延迟队列等本地文件必超时,表现为 [share 下载超时]
+                if is_emoticon_share(msg) and emoticon_cdn_url(msg):
+                    pass
+                else:
+                    msg["timestamp"] = int(time.time())
+                    msg["filepath"] = msg["filepath"].replace("\\","/")
+                    msg["filepath"] = f'''{self.dir}{msg["filepath"]}'''
+                    self.file_msg[msg["filepath"]] = ( msg , author , chat )
+                    return
             if msg["type"] == "video":
                 msg["timestamp"] = int(time.time())
                 msg["filepath"] = msg["thumb_path"].replace("\\","/").replace(".jpg", ".mp4")

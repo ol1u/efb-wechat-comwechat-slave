@@ -65,6 +65,16 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
             return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
 
     elif msg["type"] == "share":
+        # 表情包(share/appmsg type=8):走 CDN 下载并按动图发送,不当普通文件处理
+        if is_emoticon_share(msg):
+            try:
+                url = emoticon_cdn_url(msg)
+                if not url:
+                    raise ValueError("表情包 share 消息无 cdnurl")
+                file = download_file(url)
+                return efb_image_wrapper(file)
+            except:
+                return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
         if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
             file = load_local_file_to_temp(msg["filepath"])
             return efb_file_wrapper(file, os.path.basename(msg["filepath"]))

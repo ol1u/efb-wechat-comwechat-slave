@@ -26,6 +26,22 @@ def load_config(path : str) -> Dict[str, None]:
         config: Dict[str, Any] = d
     return config
 
+def is_emoticon_share(msg : dict) -> bool:
+    """判断是否为表情包形态的 share 消息(微信 appmsg type=8)。
+
+    这类消息长得像文件(带 FileStorage 路径),但实际数据在微信 CDN,
+    若按普通文件进延迟队列等本地文件,必超时。须走 CDN 下载通道。
+    """
+    if msg.get("type") != "share":
+        return False
+    text = str(msg.get("message", ""))
+    return "<appmsg>" in text and "<type>8</type>" in text
+
+def emoticon_cdn_url(msg : dict):
+    """提取表情包 share 消息中的 CDN 链接,没有则返回 None。"""
+    m = re.search("cdnurl\\s*=\\s*\"(.*?)\"", str(msg.get("message", "")))
+    return m.group(1).replace("amp;", "") if m else None
+
 def download_file(url: str, retry: int = 5, retry_interval: float = 5.0) -> tempfile:
     """
     从 URL 下载文件。相比原版更健壮:
