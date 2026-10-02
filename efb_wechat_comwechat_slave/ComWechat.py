@@ -43,6 +43,9 @@ from rich import print as rprint
 from io import BytesIO
 from PIL import Image
 
+# 语音数据库分片名(兜底用,实际以 hook 上报的句柄列表为准;移植自上游 b278d27)
+VOICE_DATABASE_NAMES = ("MediaMSG0.db", "MediaMSG1.db", "MediaMSG2.db")
+
 class ComWeChatChannel(SlaveChannel):
     channel_name : str = "ComWechatChannel"
     channel_emoji : str = "💻"
@@ -97,6 +100,7 @@ class ComWeChatChannel(SlaveChannel):
         self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
+        self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         self.base_path = self.config["base_path"] if "base_path" in self.config else self.bot.get_base_path()
         self.load()
         self.dir = self.config["dir"]
@@ -724,6 +728,33 @@ class ComWeChatChannel(SlaveChannel):
             return True
         return False
 
+    def _voice_database_names(self, refresh=False):
+        """发现微信语音数据库分片名(移植自上游 b278d27,适配本仓库结构)。
+
+        本仓库未启用 DbKeyManager,文件扫描一级不可用;直接用 hook 上报的
+        数据库句柄列表做发现,拿不到则回退到默认三个分片。结果缓存,失败时清缓存重试。
+        """
+        cached = getattr(self, "_voice_db_names", None)
+        if cached is not None and not refresh:
+            return list(cached)
+
+        names = []
+        try:
+            handles = self.bot.GetDatabaseHandles().get("data") or []
+            names = [
+                item.get("db_name")
+                for item in handles
+                if isinstance(item, dict)
+                and isinstance(item.get("db_name"), str)
+                and item["db_name"].startswith("MediaMSG")
+            ]
+        except Exception:
+            self.logger.debug("获取微信数据库句柄列表失败", exc_info=True)
+
+        if not names:
+            names = list(VOICE_DATABASE_NAMES)
+        return sorted(set(names), key=lambda name: (len(name), name))
+
     def _deliver_pending_file(self, path: str):
         """处理一条延迟等待的文件消息,成功或降级后从队列移除。"""
         msg = self.file_msg[path][0]
@@ -739,18 +770,42 @@ class ComWeChatChannel(SlaveChannel):
             self.send_efb_msgs(MsgWrapper(msg, MsgProcess(msg, chat)), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
             return
 
-        # 语音:文件未出现时尝试从数据库提取音频数据
+        # 语音:文件未出现时尝试从数据库提取音频数据,轮询全部 MediaMSG 分片
+        # (移植自上游 b278d27:之前写死只查 MediaMSG0.db,语音在别的分片就取不到)
         if msg["type"] == "voice" and not os.path.exists(path):
+            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
+            database_names = self._voice_database_names()
+            filebuffer = None
+            for attempt in range(2):
+                for db_name in database_names:
+                    try:
+                        dbresult = self.bot.QueryDatabase(
+                            db_handle=self.bot.GetDBHandle(db_name), sql=sql)["data"]
+                    except Exception:
+                        continue  # 该分片不存在或查询失败,换下一个分片
+                    if len(dbresult) == 2:
+                        filebuffer = dbresult[1][0]
+                        break
+                if filebuffer is not None:
+                    break
+                if attempt == 0:
+                    # 第一轮都没查到:清分片缓存,刷新列表再试一轮
+                    self._voice_db_names = None
+                    try:
+                        self.bot.invalidate_db_handles()
+                    except Exception:
+                        pass  # hook 无此接口时忽略
+                    database_names = self._voice_database_names(refresh=True)
+            if filebuffer is None:
+                self.logger.debug("语音数据在 %s 均未查到,继续等待文件: %s",
+                                  ",".join(database_names), path)
+                return
             try:
-                sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
-                dbresult = self.bot.QueryDatabase(db_handle=self.bot.GetDBHandle("MediaMSG0.db"), sql=sql)["data"]
-                if len(dbresult) == 2:
-                    filebuffer = dbresult[1][0]
-                    decoded = bytes(base64.b64decode(filebuffer))
-                    with open(msg["filepath"], 'wb') as f:
-                        f.write(decoded)
+                decoded = bytes(base64.b64decode(filebuffer))
+                with open(msg["filepath"], 'wb') as f:
+                    f.write(decoded)
             except Exception:
-                self.logger.exception("从数据库提取语音失败,继续等待文件: %s", path)
+                self.logger.exception("语音数据解码/写入失败,继续等待文件: %s", path)
                 return
 
         # 文件就绪且稳定才处理,避免读到下载中的半截文件
