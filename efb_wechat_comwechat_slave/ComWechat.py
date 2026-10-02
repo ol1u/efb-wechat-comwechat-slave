@@ -99,10 +99,6 @@ class ComWeChatChannel(SlaveChannel):
         # 发往 master(最终调 Telegram 接口)的投递线程池,配合超时使用,超时即放弃不拖死流水线
         self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
-        # 语音查库执行器:查库是调 hook 的 HTTP 接口,hook 卡住时不能拖死
-        # 单线程的延迟文件队列,故隔离到独立线程并加超时。
-        self._voice_db_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="cw-voicedb")
-        self._voice_db_timeout = 15  # 单次语音查库超时(秒)
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
@@ -744,21 +740,7 @@ class ComWeChatChannel(SlaveChannel):
             ...
 
         if msg["type"] == "voice":
-            try:
-                clientmsgid_match = re.search("clientmsgid=\"(.*?)\"", msg["message"])
-                if not clientmsgid_match:
-                    raise ValueError("语音消息中未找到 clientmsgid")
-                file_path = clientmsgid_match.group(1) + ".amr"
-            except Exception:
-                # 取不到 clientmsgid 时降级为文本提示,不能整条丢弃
-                self.logger.exception("语音消息解析 clientmsgid 失败,降级为文本提示: msgid=%s",
-                                      msg.get("msgid"))
-                msg['message'] = "[语音消息解析失败,请在手机端查看]"
-                msg["type"] = "text"
-                efb_msgs = MsgProcess(msg, chat)
-                self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat,
-                                   uid=MessageID(str(msg['msgid'])))
-                return
+            file_path = re.search("clientmsgid=\"(.*?)\"", msg["message"]).group(1) + ".amr"
             msg["timestamp"] = int(time.time())
             msg["filepath"] = f'''{self.dir}{msg["self"]}/{file_path}'''
             self.file_msg[msg["filepath"]] = ( msg , author , chat )
@@ -877,25 +859,10 @@ class ComWeChatChannel(SlaveChannel):
 
         # 语音:文件未出现时尝试从数据库提取音频数据,轮询全部 MediaMSG 分片
         # (移植自上游 b278d27:之前写死只查 MediaMSG0.db,语音在别的分片就取不到)
-        # 查库走独立线程+超时:hook 卡住时只跳过本轮,不拖死整个延迟文件队列。
         if msg["type"] == "voice" and not os.path.exists(path):
-            filebuffer = self._query_voice_buffer(msg["msgid"])
-            if filebuffer is None:
-                self.logger.debug("语音数据未查到,继续等待文件: %s", path)
-                return
-            try:
-                decoded = bytes(base64.b64decode(filebuffer))
-                with open(msg["filepath"], 'wb') as f:
-                    f.write(decoded)
-            except Exception:
-                self.logger.exception("语音数据解码/写入失败,继续等待文件: %s", path)
-                return
-
-    def _query_voice_buffer(self, msgid) -> Optional[bytes]:
-        """从 ComWeChat 数据库查语音 Buf,带超时。超时/异常返回 None,调用方继续等文件。"""
-        def _query():
-            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msgid}'
+            sql = f'SELECT Buf FROM Media WHERE Reserved0 = {msg["msgid"]}'
             database_names = self._voice_database_names()
+            filebuffer = None
             for attempt in range(2):
                 for db_name in database_names:
                     try:
@@ -904,7 +871,10 @@ class ComWeChatChannel(SlaveChannel):
                     except Exception:
                         continue  # 该分片不存在或查询失败,换下一个分片
                     if len(dbresult) == 2:
-                        return dbresult[1][0]
+                        filebuffer = dbresult[1][0]
+                        break
+                if filebuffer is not None:
+                    break
                 if attempt == 0:
                     # 第一轮都没查到:清分片缓存,刷新列表再试一轮
                     self._voice_db_names = None
@@ -913,18 +883,17 @@ class ComWeChatChannel(SlaveChannel):
                     except Exception:
                         pass  # hook 无此接口时忽略
                     database_names = self._voice_database_names(refresh=True)
-            return None
-
-        future = self._voice_db_executor.submit(_query)
-        try:
-            return future.result(timeout=self._voice_db_timeout)
-        except FuturesTimeoutError:
-            self.logger.warning("语音查库超时(%ss),跳过本轮继续等待文件: msgid=%s",
-                                self._voice_db_timeout, msgid)
-            return None
-        except Exception:
-            self.logger.exception("语音查库异常,继续等待文件: msgid=%s", msgid)
-            return None
+            if filebuffer is None:
+                self.logger.debug("语音数据在 %s 均未查到,继续等待文件: %s",
+                                  ",".join(database_names), path)
+                return
+            try:
+                decoded = bytes(base64.b64decode(filebuffer))
+                with open(msg["filepath"], 'wb') as f:
+                    f.write(decoded)
+            except Exception:
+                self.logger.exception("语音数据解码/写入失败,继续等待文件: %s", path)
+                return
 
         # 文件就绪且稳定才处理,避免读到下载中的半截文件
         if not (os.path.exists(path) and self._file_is_stable(path)):
@@ -1466,8 +1435,7 @@ class ComWeChatChannel(SlaveChannel):
         return None
     def stop_polling(self):
         self.db.stop_worker()
-        for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None),
-                     getattr(self, "_voice_db_executor", None)):
+        for pool in (getattr(self, "_inbound_executor", None), getattr(self, "_deliver_executor", None)):
             if pool is not None:
                 try:
                     pool.shutdown(wait=False, cancel_futures=True)

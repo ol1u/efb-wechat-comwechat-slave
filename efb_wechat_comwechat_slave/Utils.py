@@ -245,12 +245,6 @@ def convert_silk_to_mp3(file : tempfile) -> tempfile:
         pydub.AudioSegment.from_raw(file= f , sample_width=2, frame_rate=24000, channels=1) \
             .export( f , format="ogg", codec="libopus",
                     parameters=['-vbr', 'on'])
-    else:
-        # 非 SILK 格式:之前静默返回 0 字节空文件,TG 收到 0 秒/无法播放的语音。
-        # 改为抛异常,走调用方的降级提示,避免无声的坏结果。
-        file.close()
-        f.close()
-        raise ValueError("非 SILK_V3 格式音频,无法转码")
     return f
 
 
