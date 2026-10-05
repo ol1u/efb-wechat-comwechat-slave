@@ -1273,6 +1273,9 @@ class ComWeChatChannel(SlaveChannel):
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
+            # SendEmotion 的 res["msg"] 不可靠(成功也返回 "0"),与 Video 分支同样硬覆盖,
+            # 避免"微信已收到、TG 却提示失败"的误报。真失败时 SendEmotion 会直接抛异常。
+            res["msg"] = 1
 
         # 发送失败必须抛给 ETM,让用户在 TG 看到提示。
         # 注意:之前写成 try 里 raise、except 里吞掉,失败时用户毫无感知。
