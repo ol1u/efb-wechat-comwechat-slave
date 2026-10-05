@@ -641,7 +641,7 @@ class ComWeChatChannel(SlaveChannel):
                             return
                         try:
                             notice = Message()
-                            notice.text = "[Slave] 等待 ETM 投递超时,请在手机端查看"
+                            notice.text = "[消息投递超时,请在手机端查看]"
                             self.send_efb_msgs(
                                 notice,
                                 uid=f"{kwargs.get('uid')}-timeout",
@@ -1028,12 +1028,8 @@ class ComWeChatChannel(SlaveChannel):
                 if msg.text:
                     caption_reference = self.send_text(chat_uid, msg)
                     if caption_reference is None:
-                        # 配文大概率已发出,只是没拿到 msgid(_wait 已打 [msgid-missing] 警告),
-                        # 不误报失败;本条无法撤回/编辑。
-                        self.logger.warning("[Slave] 配文发送未收到 hook 回执,无法撤回/编辑")
-                        msg.uid = media_reference
-                    else:
-                        msg.uid = dump_message_ids([media_reference, caption_reference])
+                        raise EFBMessageError("发送失败，请在手机端确认")
+                    msg.uid = dump_message_ids([media_reference, caption_reference])
                 else:
                     msg.uid = media_reference
                 return msg
@@ -1073,7 +1069,7 @@ class ComWeChatChannel(SlaveChannel):
                 # ogg 损坏/格式异常时之前直接抛异常,整条发送失败且提示含糊。
                 # 改为明确报错,让用户在 TG 看到原因。
                 self.logger.exception("TG 语音转码 mp3 失败")
-                raise EFBMessageError("[Slave] 语音转码失败,请在手机端确认")
+                raise EFBMessageError("语音转码失败,请在手机端确认")
             msg.file = f
             msg.file.name = "语音留言.mp3"
             msg.type = MsgType.Video
@@ -1193,8 +1189,7 @@ class ComWeChatChannel(SlaveChannel):
                 text_msgid = self.send_text(wxid = chat_uid , msg = msg)
                 if text_msgid:
                     msg_ids.append(text_msgid)
-                # 注意:不拿 text_msgid 判失败。_wait 拿不到 msgid 只记 [msgid-missing] 警告,
-                # SendText 没抛异常即视为已发出,不误报。
+                res = {"msg": "1" if text_msgid else "0"}
         elif msg.type in [MsgType.Link]:
             link_msgid = self.send_text(wxid = chat_uid , msg = msg)
             if link_msgid:
@@ -1253,18 +1248,20 @@ class ComWeChatChannel(SlaveChannel):
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
+            if msg.type == MsgType.Video:
+                res["msg"] = 1
         elif msg.type in [MsgType.Animation]:
             name = os.path.basename(msg.file.name)
             local_path = f"{self.dir}{self.wxid}/{name}"
             load_temp_file_to_local(msg.file, local_path)
-
+            
             # WSL环境下需要将路径转换为Windows格式
             if self.is_wsl:
                 file_path = self._wsl_to_windows_path(local_path)
                 self.logger.debug(f"WSL路径转换: {local_path} -> {file_path}")
             else:
                 file_path = os.path.join(self.base_path, self.wxid, name)
-
+            
             self.logger.debug(f"发送动画表情路径: {file_path}")
             file_key = (chat_uid, None, self.file_lock_key)
             with self.pending_lock:
@@ -1276,11 +1273,18 @@ class ComWeChatChannel(SlaveChannel):
             self.delete_file[local_path] = int(time.time())
             if msg.text:
                 self.send_text(wxid = chat_uid , msg = msg)
+            # SendEmotion 的 res["msg"] 不可靠(成功也返回 "0"),与 Video 分支同样硬覆盖,
+            # 避免"微信已收到、TG 却提示失败"的误报。真失败时 SendEmotion 会直接抛异常。
+            res["msg"] = 1
 
-        # 注意:不再用 res["msg"]=="0" 判断发送失败——hook 这个字段不可靠
-        # (SendFile/SendEmotion 成功也返回 "0",已多次误报"微信已收到、TG 却提示失败")。
-        # 真失败时 bot.SendX 会直接抛异常;_wait 拿不到 msgid 只记 [msgid-missing] 警告,
-        # 表示消息大概率已发出、只是无法撤回/编辑,不误报失败。
+        # 发送失败必须抛给 ETM,让用户在 TG 看到提示。
+        # 注意:之前写成 try 里 raise、except 里吞掉,失败时用户毫无感知。
+        try:
+            send_failed = str(res["msg"]) == "0"
+        except Exception:
+            send_failed = False  # res 结构异常时不误判,保持原有容错行为
+        if send_failed:
+            raise EFBMessageError("发送失败，请在手机端确认")
         # 保存微信 msgid 供撤回/编辑用(移植自上游)
         if msg_ids:
             msg.uid = dump_message_ids(msg_ids)
