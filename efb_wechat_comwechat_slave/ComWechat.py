@@ -100,6 +100,7 @@ class ComWeChatChannel(SlaveChannel):
         # 发往 master(最终调 Telegram 接口)的投递线程池,配合超时使用,超时即放弃不拖死流水线
         self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
+        self._deliver_notice_grace = 120  # 投递超时后,等 ETM 宽限这么多秒再决定是否发提示,避免误报
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
@@ -629,23 +630,32 @@ class ComWeChatChannel(SlaveChannel):
                 self.logger.error(
                     "投递消息到 Telegram 超时(%ss),已跳过以保住流水线: type=%s uid=%s",
                     self._deliver_timeout, getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
-                # 尽力而为:补一条超时提示,避免用户侧无声丢失。
-                # 提示本身也走同样的超时投递,若网络已断则发不出,仅记日志。
+                # 优雅处理:超时后不立即发提示,给 ETM 一个宽限期。
+                # ETM 可能只是在后台重试(如网络抖动),宽限期内完成就不打扰用户,避免误报。
+                # 宽限期后仍未完成,才发超时提示;提示本身走同样的超时投递,若网络已断则发不出,仅记日志。
                 # _is_timeout_notice 防止提示的投递再超时时无限递归。
                 if not kwargs.get('_is_timeout_notice'):
-                    try:
-                        notice = Message()
-                        notice.text = "[消息投递超时,请在手机端查看]"
-                        self.send_efb_msgs(
-                            notice,
-                            uid=f"{kwargs.get('uid')}-timeout",
-                            chat=kwargs.get('chat'),
-                            author=kwargs.get('author'),
-                            type=MsgType.Text,
-                            _is_timeout_notice=True,
-                        )
-                    except Exception:
-                        self.logger.exception("发送投递超时提示失败")
+                    def _grace_expired():
+                        if future.done():
+                            # 宽限期内完成了(成功,或 ETM 已自行提示失败),不误报
+                            return
+                        try:
+                            notice = Message()
+                            notice.text = "[消息投递超时,请在手机端查看]"
+                            self.send_efb_msgs(
+                                notice,
+                                uid=f"{kwargs.get('uid')}-timeout",
+                                chat=kwargs.get('chat'),
+                                author=kwargs.get('author'),
+                                type=MsgType.Text,
+                                _is_timeout_notice=True,
+                            )
+                        except Exception:
+                            self.logger.exception("发送投递超时提示失败")
+                    timer = threading.Timer(self._deliver_notice_grace, _grace_expired)
+                    timer.daemon = True
+                    timer.name = "cw-timeout-notice"
+                    timer.start()
             except Exception:
                 self.logger.exception("投递消息到 Telegram 异常: uid=%s", kwargs.get('uid'))
 
