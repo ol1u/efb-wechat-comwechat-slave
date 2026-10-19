@@ -59,12 +59,31 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
     elif msg["type"] == "animatedsticker":
         try:
             url = re.search("cdnurl\s*=\s*\"(.*?)\"", msg["message"]).group(1).replace("amp;", "")
+            if not url:
+                # 企业微信转发的表情包 cdnurl 为空,回退到 tpurl(企业微信文件 CDN)
+                m = re.search("tpurl\s*=\s*\"(.*?)\"", msg["message"])
+                url = m.group(1).replace("amp;", "") if m else ""
             file = download_file(url)
             return efb_image_wrapper(file)
         except:
             return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
 
     elif msg["type"] == "share":
+        # 引用回复(appmsg type=57):解析 <refermsg>，把被引用的内容拼在前面，
+        # TG 里显示为 "[引用 @昵称: 原文]\n回复内容"。上游 jiz4oh 未处理，此处补上。
+        if "<refermsg>" in msg.get("message", ""):
+            try:
+                from lxml import etree as _etree
+                _xml = _etree.fromstring(msg["message"])
+                _title = _xml.xpath('string(/msg/appmsg/title)') or ""
+                _q_name = _xml.xpath('string(/msg/appmsg/refermsg/displayname)') or ""
+                _q_content = _xml.xpath('string(/msg/appmsg/refermsg/content)') or ""
+                if _q_content:
+                    _quote_line = f"[引用 {_q_name + ': ' if _q_name else ''}{_q_content}]"
+                    _text = f"{_quote_line}\n{_title}" if _title else _quote_line
+                    return efb_text_simple_wrapper(_text)
+            except Exception:
+                pass  # 解析失败则走原有 share 流程
         # 表情包(share/appmsg type=8):依次尝试 CDN 通道,都不行则快速失败。
         # 大表情包以加密文件形式传输且 CDN 有防盗链,本地文件也永不出现,
         # 故不进 120 秒延迟等待,几秒内给出明确结果。
