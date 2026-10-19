@@ -65,6 +65,23 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
             return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
 
     elif msg["type"] == "share":
+        # 引用回复(appmsg type=57):解析 <refermsg>，把"谁引用了什么"拼进文本。
+        # - 对方引用微信消息(TG 已是原生回复):补上微信名
+        # - 对方引用我从 TG 发的消息:文本前缀展示引用关系(不做原生回复)
+        # 格式: "[引用 阿豪: 1]\n2"。上游 jiz4oh 未处理。
+        if "<refermsg>" in msg.get("message", ""):
+            try:
+                from lxml import etree as _etree
+                _xml = _etree.fromstring(msg["message"])
+                _title = _xml.xpath('string(/msg/appmsg/title)') or ""
+                _q_name = _xml.xpath('string(/msg/appmsg/refermsg/displayname)') or ""
+                _q_content = _xml.xpath('string(/msg/appmsg/refermsg/content)') or ""
+                if _q_content:
+                    _quote_line = f"[引用 {_q_name + ': ' if _q_name else ''}{_q_content}]"
+                    _text = f"{_quote_line}\n{_title}" if _title else _quote_line
+                    return efb_text_simple_wrapper(_text)
+            except Exception:
+                pass  # 解析失败则走原有 share 流程
         # 表情包(share/appmsg type=8):依次尝试 CDN 通道,都不行则快速失败。
         # 大表情包以加密文件形式传输且 CDN 有防盗链,本地文件也永不出现,
         # 故不进 120 秒延迟等待,几秒内给出明确结果。
