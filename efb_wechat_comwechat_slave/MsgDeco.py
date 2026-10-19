@@ -489,7 +489,10 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                     pass
             if refer_displayname is not None:
                 prefix = f"{refer_displayname}:"
-            if refer_svrid is None or (refer_chatusr == message["self"] and sent_by_master):
+            # 被引用的消息是自己从 TG 发出去的(fromusr 是自己):强制文本拼接,
+            # 不走原生回复(ETM 侧映射常缺失,原生回复会静默丢失引用关系)
+            _quoted_self = refer_fromusr is not None and refer_fromusr == message["self"]
+            if _quoted_self or refer_svrid is None or (refer_chatusr == message["self"] and sent_by_master):
                 if refer_msgType == 1: # 被引用的消息是文本
                     refer_content = xml.xpath('/msg/appmsg/refermsg/content/text()')[0] # 被引用消息内容
                     result_text = qutoed_text(refer_content, msg, prefix)
@@ -513,6 +516,9 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                     uid=MessageID(refer_svrid),
                     chat=chat,
                 )
+                # 原生回复可跳转，但 TG 预览可能不显示被引用者名字，文本里补上
+                if refer_displayname:
+                    efb_msg.text = f"[{refer_displayname}] {msg}"
         elif type == 63: # 直播（微信视频号分享）
             title = xml.xpath('/msg/appmsg/title/text()')[0]
             url = xml.xpath('/msg/appmsg/url/text()')[0]
