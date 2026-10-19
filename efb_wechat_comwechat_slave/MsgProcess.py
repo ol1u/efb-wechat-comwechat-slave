@@ -59,6 +59,10 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
     elif msg["type"] == "animatedsticker":
         try:
             url = re.search("cdnurl\s*=\s*\"(.*?)\"", msg["message"]).group(1).replace("amp;", "")
+            if not url:
+                # 企业微信转发的表情包 cdnurl 为空,回退到 tpurl(企业微信文件 CDN)
+                m = re.search("tpurl\s*=\s*\"(.*?)\"", msg["message"])
+                url = m.group(1).replace("amp;", "") if m else ""
             file = download_file(url)
             return efb_image_wrapper(file)
         except:
