@@ -516,9 +516,6 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                     uid=MessageID(refer_svrid),
                     chat=chat,
                 )
-                # 原生回复可跳转，但 TG 预览可能不显示被引用者名字，文本里补上
-                if refer_displayname:
-                    efb_msg.text = f"[{refer_displayname}] {msg}"
         elif type == 63: # 直播（微信视频号分享）
             title = xml.xpath('/msg/appmsg/title/text()')[0]
             url = xml.xpath('/msg/appmsg/url/text()')[0]
