@@ -1189,11 +1189,12 @@ class ComWeChatChannel(SlaveChannel):
                 text_msgid = self.send_text(wxid = chat_uid , msg = msg)
                 if text_msgid:
                     msg_ids.append(text_msgid)
-                res = {"msg": "1" if text_msgid else "0"}
+                res = {"msg": "1"}  # send_text 没抛异常即 API 成功；msgid 缺失仅影响撤回/编辑
         elif msg.type in [MsgType.Link]:
             link_msgid = self.send_text(wxid = chat_uid , msg = msg)
             if link_msgid:
                 msg_ids.append(link_msgid)
+            res = {"msg": "1"}  # 同上；之前 res 未赋值，真失败被 except 吞成静默成功
         elif msg.type in [MsgType.Image , MsgType.Sticker]:
             name = os.path.basename(msg.file.name)
             local_path = f"{self.dir}{self.wxid}/{name}"
@@ -1346,12 +1347,17 @@ class ComWeChatChannel(SlaveChannel):
                         key = (wxid, xml)
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
-                        self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+                        api_res = self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+                        if isinstance(api_res, dict) and str(api_res.get("msg")) == "0":
+                            raise EFBMessageError("发送失败，请在手机端确认")
                         return self._wait(key, self.send_timeout)
         key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
-        self.bot.SendText(wxid = wxid , msg = text)
+        api_res = self.bot.SendText(wxid = wxid , msg = text)
+        if isinstance(api_res, dict) and str(api_res.get("msg")) == "0":
+            raise EFBMessageError("发送失败，请在手机端确认")
+        # API 没抛异常即发送成功；msgid 拿不到只记 [msgid-missing] 告警（_wait 内已有），不判失败
         return self._wait(key, self.send_timeout)
 
     def get_chat_picture(self, chat: 'Chat') -> BinaryIO:
