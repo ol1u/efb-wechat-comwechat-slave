@@ -636,9 +636,10 @@ class ComWeChatChannel(SlaveChannel):
                 # _is_timeout_notice 防止提示的投递再超时时无限递归。
                 if not kwargs.get('_is_timeout_notice'):
                     def _grace_expired():
-                        if future.done():
-                            # 宽限期内完成了(成功,或 ETM 已自行提示失败),不误报
+                        if future.done() and future.exception() is None:
+                            # 宽限期内成功完成了,不误报
                             return
+                        # 仍在跑,或已失败(有异常):发提示
                         try:
                             notice = Message()
                             notice.text = "[消息投递超时,请在手机端查看]"
