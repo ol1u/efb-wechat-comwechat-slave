@@ -1353,17 +1353,14 @@ class ComWeChatChannel(SlaveChannel):
                         key = (wxid, xml)
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
-                        api_res = self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
-                        if isinstance(api_res, dict) and str(api_res.get("msg")) == "0":
-                            raise EFBMessageError("发送失败，请在手机端确认")
+                        self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
                         return self._wait(key, self.send_timeout)
         key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
-        api_res = self.bot.SendText(wxid = wxid , msg = text)
-        if isinstance(api_res, dict) and str(api_res.get("msg")) == "0":
-            raise EFBMessageError("发送失败，请在手机端确认")
-        # API 没抛异常即发送成功；msgid 拿不到只记 [msgid-missing] 告警（_wait 内已有），不判失败
+        self.bot.SendText(wxid = wxid , msg = text)
+        # API 没抛异常即发送成功（hook 的 {msg} 返回值不可靠，不做判断）；
+        # msgid 拿不到只记 [msgid-missing] 告警（_wait 内已有），不判失败
         return self._wait(key, self.send_timeout)
 
     def get_chat_picture(self, chat: 'Chat') -> BinaryIO:
