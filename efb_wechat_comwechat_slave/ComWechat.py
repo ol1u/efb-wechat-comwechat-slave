@@ -1350,19 +1350,6 @@ class ComWeChatChannel(SlaveChannel):
                         else:
                             content = "<content />"
                         xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                        # 优先用原生引用 API（SendQuoteText），失败则降级为手拼 XML
-                        send_quote_text = getattr(self.bot, "SendQuoteText", None)
-                        if callable(send_quote_text):
-                            try:
-                                key = (wxid, text)
-                                with self.pending_lock:
-                                    self.sent_msgs[key] = threading.Event()
-                                send_quote_text(wxid=wxid, msg=text, target_msgid=target_msgid)
-                                return self._wait(key, self.send_timeout)
-                            except Exception as e:
-                                self.logger.warning(f"原生引用 API 失败，降级为 XML 引用: {e}")
-                                with self.pending_lock:
-                                    self.sent_msgs.pop(key, None)
                         key = (wxid, xml)
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
