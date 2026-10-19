@@ -1217,7 +1217,9 @@ class ComWeChatChannel(SlaveChannel):
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
-                self.send_text(wxid = chat_uid , msg = msg)
+                caption_msgid = self.send_text(wxid = chat_uid , msg = msg)
+                if caption_msgid:
+                    msg_ids.append(caption_msgid)
         elif msg.type in [MsgType.File , MsgType.Video]:
             name = os.path.basename(msg.file.name)
             local_path = f"{self.dir}{self.wxid}/{name}"
@@ -1248,7 +1250,9 @@ class ComWeChatChannel(SlaveChannel):
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
-                self.send_text(wxid = chat_uid , msg = msg)
+                caption_msgid = self.send_text(wxid = chat_uid , msg = msg)
+                if caption_msgid:
+                    msg_ids.append(caption_msgid)
             if msg.type == MsgType.Video:
                 res["msg"] = 1
         elif msg.type in [MsgType.Animation]:
@@ -1273,7 +1277,9 @@ class ComWeChatChannel(SlaveChannel):
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
             if msg.text:
-                self.send_text(wxid = chat_uid , msg = msg)
+                caption_msgid = self.send_text(wxid = chat_uid , msg = msg)
+                if caption_msgid:
+                    msg_ids.append(caption_msgid)
             # SendEmotion 的 res["msg"] 不可靠(成功也返回 "0"),与 Video 分支同样硬覆盖,
             # 避免"微信已收到、TG 却提示失败"的误报。真失败时 SendEmotion 会直接抛异常。
             res["msg"] = 1
