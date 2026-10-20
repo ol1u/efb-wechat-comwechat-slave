@@ -28,7 +28,7 @@ from ehforwarderbot.types import MessageID, ChatID, InstanceID
 from ehforwarderbot import utils as efb_utils
 from ehforwarderbot.exceptions import EFBException, EFBChatNotFound, EFBMessageError, EFBOperationNotSupported
 from ehforwarderbot.message import MessageCommand, MessageCommands
-from ehforwarderbot.status import MessageRemoval, ChatUpdates, MemberUpdates
+from ehforwarderbot.status import MessageRemoval, ChatUpdates
 
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
@@ -419,33 +419,16 @@ class ComWeChatChannel(SlaveChannel):
             content = {}
             sender = msg["sender"]
             fromnickname = re.search('fromnickname="(.*?)"', msg["message"]).group(1)
-            # (移植 jiz4oh 好友申请增强)多提取微信号/签名/来源,字段缺失时不显示,不抛异常
-            def _frdver_attr(pattern):
-                m = re.search(pattern, msg["message"])
-                return m.group(1) if m else ""
-            wxid = _frdver_attr('fromusername="(.*?)"')
-            sign = _frdver_attr('sign="(.*?)"')
             apply_content = re.search('content="(.*?)"', msg["message"]).group(1)
-            chatroom = _frdver_attr('chatroomusername="(.*?)"')
-            source = "朋友验证消息"
-            if chatroom:
-                source = f"来自群聊: {self.get_name_by_wxid(chatroom)}"
-            else:
-                sharecardnickname = _frdver_attr('sharecardnickname="(.*?)"')
-                if sharecardnickname:
-                    source = f"对方通过 \"{sharecardnickname}\" 分享的名片添加"
             url = re.search('bigheadimgurl="(.*?)"', msg["message"]).group(1)
             v3 = re.search('encryptusername="(v3.*?)"', msg["message"]).group(1)
             v4 = re.search('ticket="(v4.*?)"', msg["message"]).group(1)
-            _lines = ["好友申请:", f"名字: {fromnickname}"]
-            if wxid:
-                _lines.append(f"微信号: {wxid}")
-            if sign:
-                _lines.append(f"个性签名: {sign}")
-            _lines.append(f"验证内容: {apply_content}")
-            _lines.append(f"来源: {source}")
-            _lines.append(f"头像: {url}")
-            text = "\n".join(_lines)
+            text = (
+                "好友申请:\n"
+                f"名字: {fromnickname}\n"
+                f"验证内容: {apply_content}\n"
+                f"头像: {url}"
+            )
 
             commands = [
                 MessageCommand(
@@ -719,46 +702,10 @@ class ComWeChatChannel(SlaveChannel):
     def _handle_msg_guarded(self, msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
         try:
             self.handle_msg(msg, author, chat)
-            self._report_group_membership(msg, chat)
         except Exception:
             # 毒消息(缺字段、结构异常等)不能无声丢失,记 ERROR 便于定位
             self.logger.exception("处理入站消息失败,已丢弃: type=%s msgid=%s",
                                   msg.get("type"), msg.get("msgid"))
-
-    def _report_group_membership(self, msg : Dict[str, Any] , chat : 'Chat'):
-        """(移植 jiz4oh 群成员变动通知,适配中文文案)群系统消息里识别进群/解散,上报给主端。"""
-        if msg.get("type") != "sysmsg" or "@chatroom" not in str(msg.get("sender", "")):
-            return
-        text = str(msg.get("message", ""))
-        try:
-            # 有人被邀请进群(中文文案,含直/弯引号两种写法)
-            match = re.search(r'邀请["“]([^"”]+)["”]加入了群聊', text) \
-                or re.search(r'^(.*?) invited (.*?) to the group chat$', text)
-            if match:
-                new_member = match.group(2) if match.re is not None and match.lastindex and match.lastindex >= 2 else match.group(1)
-                coordinator.send_status(
-                    MemberUpdates(self, chat, new_members=[ChatID(new_member)])
-                )
-                self.logger.debug("群成员变动: %s 加入 %s", new_member, chat.uid)
-                return
-            # 通过二维码等方式进群(第一个被引号括起的是进群者)
-            match = re.search(r'["“]([^"”]+)["”]通过扫描.*加入了群聊', text) \
-                or re.search(r'["“]([^"”]+)["”]加入了群聊', text)
-            if match:
-                coordinator.send_status(
-                    MemberUpdates(self, chat, new_members=[ChatID(match.group(1))])
-                )
-                self.logger.debug("群成员变动: %s 加入 %s", match.group(1), chat.uid)
-                return
-            # 群被解散
-            if ("解散" in text and "群聊" in text) \
-                or re.search(r'^.*? has deleted this group.$', text):
-                coordinator.send_status(
-                    ChatUpdates(channel=self, removed_chats=[chat])
-                )
-                self.logger.debug("群成员变动: 群 %s 已解散", chat.uid)
-        except Exception:
-            self.logger.exception("群成员变动上报失败: msgid=%s", msg.get("msgid"))
 
     def handle_msg(self , msg : Dict[str, Any] , author : 'ChatMember' , chat : 'Chat'):
         emojiList = re.findall('\[[\w|！|!| ]+\]' , msg["message"])
@@ -1349,120 +1296,66 @@ class ComWeChatChannel(SlaveChannel):
         # 保存微信 msgid 供撤回/编辑用(移植自上游)
         if msg_ids:
             msg.uid = dump_message_ids(msg_ids)
-            # (A 档)落盘引用记录,供日后引用这条消息时解析 msgid
-            self._record_message_reference(msg.uid, msg_ids[0])
         return msg
-
-    # ---------- (A 档)消息引用记录:uid -> 微信 msgid,持久化落盘 ----------
-    def _reference_store_path(self) -> str:
-        return os.path.join(str(efb_utils.get_data_path(self.channel_id)), "message_references.json")
-
-    def _load_message_references(self) -> Dict[str, str]:
-        store = getattr(self, "_message_references", None)
-        if store is None:
-            store = {}
-            try:
-                with open(self._reference_store_path(), encoding="utf-8") as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    store = {str(k): str(v) for k, v in data.items()}
-            except Exception:
-                pass
-            self._message_references = store
-        return store
-
-    def _record_message_reference(self, uid, msgid) -> None:
-        if not uid or not msgid:
-            return
-        try:
-            store = self._load_message_references()
-            if store.get(str(uid)) == str(msgid):
-                return
-            store[str(uid)] = str(msgid)
-            # 上限 5000 条,超出丢最旧的(dict 保插入序)
-            while len(store) > 5000:
-                store.pop(next(iter(store)))
-            path = self._reference_store_path()
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            tmp_path = path + ".tmp"
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(store, f, ensure_ascii=False)
-            os.replace(tmp_path, path)
-        except Exception:
-            self.logger.debug("保存消息引用记录失败", exc_info=True)
-
-    def _resolve_target_msgid(self, target) -> Optional[str]:
-        """引用目标 msgid 多路解析:uid 现解析 -> 原始 hook 数据 -> 持久化引用记录。"""
-        for item in load_message_ids(target.uid or ""):
-            if item.isdecimal():
-                return item
-        try:
-            info = target.vendor_specific.get("comwechat_info", {}) if target.vendor_specific else {}
-            mid = info.get("msgid")
-            if mid and str(mid).isdecimal():
-                return str(mid)
-        except Exception:
-            pass
-        store = self._load_message_references()
-        if str(target.uid or "") in store:
-            return store[str(target.uid)]
-        for item in load_message_ids(target.uid or ""):
-            if str(item) in store:
-                return store[str(item)]
-        return None
 
     def send_text(self, wxid: ChatID, msg: Message) -> Optional[MessageID]:
         """发送文本并等待 hook 回传微信 msgid(移植自上游,用于撤回/编辑)。
         返回微信服务器 msgid,超时/失败返回 None。"""
         text = msg.text
         if isinstance(msg.target, Message):
-                # (A 档升级)不再区别对待自己发的消息:与别人的消息一样走原生引用。
-                # 目标 msgid 多路解析(见 _resolve_target_msgid),全部失败才降级为文本引用,
-                # 避免拼出坏 XML(移植自上游 c1c7bae 思想)。
-                target_msgid = self._resolve_target_msgid(msg.target)
-                if target_msgid is None:
-                    self.logger.debug(
-                        "引用目标无有效微信 msgid,降级为文本引用: uid=%s", msg.target.uid)
+                if isinstance(msg.target.author, SelfChatMember) and isinstance(msg.target.deliver_to, SlaveChannel):
                     qt_txt = msg.target.text or msg.target.type.name
                     text = qutoed_text(qt_txt, msg.text)
                 else:
-                    msgid = target_msgid
-                    sender = msg.target.author.uid
-                    displayname = self.group_members.get(wxid,{}).get(sender, self.get_nickname_by_wxid(sender))
-                    content = escape(msg.target.vendor_specific.get("wx_xml", ""), {
-                        "\n": "&#x0A;",
-                        "\t": "&#x09;",
-                        '"': "&quot;",
-                    }) or msg.target.text
-                    comwechat_info = msg.target.vendor_specific.get("comwechat_info", {})
-                    if comwechat_info.get("type", None) == "animatedsticker":
-                        refer_type = 47
-                    elif msg.target.type == MsgType.Image:
-                        refer_type = 3
-                    elif msg.target.type == MsgType.Voice:
-                        refer_type = 34
-                    elif msg.target.type == MsgType.Video:
-                        refer_type = 43
-                    elif msg.target.type == MsgType.Sticker:
-                        refer_type = 47
-                    elif msg.target.type == MsgType.Location:
-                        refer_type = 48
-                    elif msg.target.type == MsgType.File:
-                        refer_type = 49
-                    elif comwechat_info.get("type", None) == "share":
-                        refer_type = 49
+                    # 取第一个有效的微信 msgid;没有则降级为文本引用,避免拼出坏 XML
+                    # (移植自上游 c1c7bae 思想:引用目标无有效 msgid 时不硬拼)
+                    target_msgid = next(
+                        (item for item in load_message_ids(msg.target.uid or "") if item.isdecimal()),
+                        None,
+                    )
+                    if target_msgid is None:
+                        self.logger.debug(
+                            "引用目标无有效微信 msgid,降级为文本引用: uid=%s", msg.target.uid)
+                        qt_txt = msg.target.text or msg.target.type.name
+                        text = qutoed_text(qt_txt, msg.text)
                     else:
-                        refer_type = 1
-                    if content:
-                        content = "<content>%s</content>" % content
-                    else:
-                        content = "<content />"
-                    xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
-                    key = (wxid, xml)
-                    with self.pending_lock:
-                        self.sent_msgs[key] = threading.Event()
-                    self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
-                    return self._wait(key, self.send_timeout)
+                        msgid = target_msgid
+                        sender = msg.target.author.uid
+                        displayname = self.group_members.get(wxid,{}).get(sender, self.get_nickname_by_wxid(sender))
+                        content = escape(msg.target.vendor_specific.get("wx_xml", ""), {
+                            "\n": "&#x0A;",
+                            "\t": "&#x09;",
+                            '"': "&quot;",
+                        }) or msg.target.text
+                        comwechat_info = msg.target.vendor_specific.get("comwechat_info", {})
+                        if comwechat_info.get("type", None) == "animatedsticker":
+                            refer_type = 47
+                        elif msg.target.type == MsgType.Image:
+                            refer_type = 3
+                        elif msg.target.type == MsgType.Voice:
+                            refer_type = 34
+                        elif msg.target.type == MsgType.Video:
+                            refer_type = 43
+                        elif msg.target.type == MsgType.Sticker:
+                            refer_type = 47
+                        elif msg.target.type == MsgType.Location:
+                            refer_type = 48
+                        elif msg.target.type == MsgType.File:
+                            refer_type = 49
+                        elif comwechat_info.get("type", None) == "share":
+                            refer_type = 49
+                        else:
+                            refer_type = 1
+                        if content:
+                            content = "<content>%s</content>" % content
+                        else:
+                            content = "<content />"
+                        xml = QUOTE_MESSAGE % (self.wxid, text, refer_type, msgid, sender, sender, displayname, content)
+                        key = (wxid, xml)
+                        with self.pending_lock:
+                            self.sent_msgs[key] = threading.Event()
+                        self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
+                        return self._wait(key, self.send_timeout)
         key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
