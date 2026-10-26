@@ -1221,6 +1221,10 @@ class ComWeChatChannel(SlaveChannel):
                 caption_msgid = self.send_text(wxid = chat_uid , msg = msg)
                 if caption_msgid:
                     msg_ids.append(caption_msgid)
+            # SendImage 的 res["msg"] 不可靠(成功也可能返回 "0"),与 Video/Animation
+            # 分支同样硬覆盖,避免"微信已收到、TG 却提示失败"的误报。
+            # 真失败时 SendImage 会直接抛异常。
+            res["msg"] = 1
         elif msg.type in [MsgType.File , MsgType.Video]:
             name = os.path.basename(msg.file.name)
             local_path = f"{self.dir}{self.wxid}/{name}"
