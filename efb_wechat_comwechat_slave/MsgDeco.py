@@ -438,8 +438,12 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 vendor_specific={ "is_forwarded": True }
             )
         elif type == 51: # 视频（微信视频号分享）
-            title = xml.xpath('/msg/appmsg/title/text()')[0]
-            url = xml.xpath('/msg/appmsg/url/text()')[0]
+            # 视频号分享的 XML 常常没有 /msg/appmsg/url 节点(视频靠 finderFeed
+            # 内部 ID 引用,无网页链接):url 缺失时不再崩,改发文本消息保住内容。
+            title_nodes = xml.xpath('/msg/appmsg/title/text()')
+            title = title_nodes[0] if title_nodes else "微信视频号分享"
+            url_nodes = xml.xpath('/msg/appmsg/url/text()')
+            url = url_nodes[0] if url_nodes else None
             if len(xml.xpath('/msg/appmsg/finderFeed/avatar/text()'))!=0:
                 imgurl = xml.xpath('/msg/appmsg/finderFeed/avatar/text()')[0].strip("<![CDATA[").strip("]]>")
             else:
@@ -448,19 +452,35 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 desc = xml.xpath('/msg/appmsg/finderFeed/desc/text()')[0]
             else:
                 desc = None
+            if len(xml.xpath('/msg/appmsg/finderFeed/nickname/text()'))!=0:
+                nickname = xml.xpath('/msg/appmsg/finderFeed/nickname/text()')[0]
+            else:
+                nickname = None
             result_text += f"微信视频号分享\n - - - - - - - - - - - - - - - \n"
-            attribute = LinkAttribute(
-                title=title,
-                description=  '\n' + desc,
-                url= url,
-                image= imgurl
-            )
-            efb_msg = Message(
-                attributes=attribute,
-                type=MsgType.Link,
-                text=result_text,
-                vendor_specific={ "is_mp": True }
-            )
+            if url:
+                attribute = LinkAttribute(
+                    title=title,
+                    description=('\n' + desc) if desc else None,
+                    url=url,
+                    image=imgurl
+                )
+                efb_msg = Message(
+                    attributes=attribute,
+                    type=MsgType.Link,
+                    text=result_text,
+                    vendor_specific={ "is_mp": True }
+                )
+            else:
+                text = result_text + title
+                if desc:
+                    text += "\n" + desc
+                if nickname:
+                    text += f"\n作者：{nickname}"
+                efb_msg = Message(
+                    type=MsgType.Text,
+                    text=text,
+                    vendor_specific={ "is_mp": True }
+                )
         elif type == 57: # 引用（回复）消息
             msg = xml.xpath('/msg/appmsg/title/text()')[0]
             refer_msgType = int(xml.xpath('/msg/appmsg/refermsg/type/text()')[0]) # 被引用消息类型
@@ -517,23 +537,38 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                     chat=chat,
                 )
         elif type == 63: # 直播（微信视频号分享）
-            title = xml.xpath('/msg/appmsg/title/text()')[0]
-            url = xml.xpath('/msg/appmsg/url/text()')[0]
-            imgurl = xml.xpath('/msg/appmsg/finderLive/headUrl/text()')[0].strip("<![CDATA[").strip("]]>")
-            desc = xml.xpath('/msg/appmsg/finderLive/desc/text()')[0].strip("<![CDATA[").strip("]]>")
+            # 与 type 51 同理:url/headUrl/desc 均可能缺失,缺失时改发文本消息。
+            title_nodes = xml.xpath('/msg/appmsg/title/text()')
+            title = title_nodes[0] if title_nodes else "视频号直播分享"
+            url_nodes = xml.xpath('/msg/appmsg/url/text()')
+            url = url_nodes[0] if url_nodes else None
+            head_nodes = xml.xpath('/msg/appmsg/finderLive/headUrl/text()')
+            imgurl = head_nodes[0].strip("<![CDATA[").strip("]]>") if head_nodes else None
+            desc_nodes = xml.xpath('/msg/appmsg/finderLive/desc/text()')
+            desc = desc_nodes[0].strip("<![CDATA[").strip("]]>") if desc_nodes else None
             result_text += f"视频号直播分享\n  - - - - - - - - - - - - - - - \n"
-            attribute = LinkAttribute(
-                title=title,
-                description= '\n' + desc ,
-                url= url,
-                image= imgurl
-            )
-            efb_msg = Message(
-                attributes=attribute,
-                type=MsgType.Link,
-                text=result_text,
-                vendor_specific={ "is_mp": True }
-            )
+            if url:
+                attribute = LinkAttribute(
+                    title=title,
+                    description=('\n' + desc) if desc else None,
+                    url=url,
+                    image=imgurl
+                )
+                efb_msg = Message(
+                    attributes=attribute,
+                    type=MsgType.Link,
+                    text=result_text,
+                    vendor_specific={ "is_mp": True }
+                )
+            else:
+                text = result_text + title
+                if desc:
+                    text += "\n" + desc
+                efb_msg = Message(
+                    type=MsgType.Text,
+                    text=text,
+                    vendor_specific={ "is_mp": True }
+                )
         elif type == 87: # 群公告
             return
         #     title = xml.xpath('/msg/appmsg/textannouncement/text()')[0]

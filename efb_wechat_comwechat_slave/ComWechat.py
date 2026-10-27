@@ -7,6 +7,7 @@ from traceback import print_exc
 from pydub import AudioSegment
 import os
 import base64
+import copy
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -36,6 +37,7 @@ from .MsgDeco import qutoed_text
 from .MsgProcess import MsgProcess, MsgWrapper
 from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference
 from .db import DatabaseManager
+from .delivery_retry import DeliveryRetryQueue
 from .Constant import QUOTE_MESSAGE
 
 from rich.console import Console
@@ -100,7 +102,8 @@ class ComWeChatChannel(SlaveChannel):
         # 发往 master(最终调 Telegram 接口)的投递线程池,配合超时使用,超时即放弃不拖死流水线
         self._deliver_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="cw-deliver")
         self._deliver_timeout = 60  # 单条消息投递超时(秒)
-        self._deliver_notice_grace = 120  # 投递超时后,等 ETM 宽限这么多秒再决定是否发提示,避免误报
+        # 投递失败(超时/异常)后的延迟重投队列:60s/5min/15min 退避,3 次均失败才发超时提示。
+        self._deliver_retry = DeliveryRetryQueue()
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
@@ -628,37 +631,71 @@ class ComWeChatChannel(SlaveChannel):
                 future.result(timeout=self._deliver_timeout)
             except FuturesTimeoutError:
                 self.logger.error(
-                    "投递消息到 Telegram 超时(%ss),已跳过以保住流水线: type=%s uid=%s",
+                    "投递消息到 Telegram 超时(%ss),已进入重投队列: type=%s uid=%s",
                     self._deliver_timeout, getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
-                # 优雅处理:超时后不立即发提示,给 ETM 一个宽限期。
-                # ETM 可能只是在后台重试(如网络抖动),宽限期内完成就不打扰用户,避免误报。
-                # 宽限期后仍未完成,才发超时提示;提示本身走同样的超时投递,若网络已断则发不出,仅记日志。
-                # _is_timeout_notice 防止提示的投递再超时时无限递归。
-                if not kwargs.get('_is_timeout_notice'):
-                    def _grace_expired():
-                        if future.done() and future.exception() is None:
-                            # 宽限期内成功完成了,不误报
-                            return
-                        # 仍在跑,或已失败(有异常):发提示
-                        try:
-                            notice = Message()
-                            notice.text = "[消息投递超时,请在手机端查看]"
-                            self.send_efb_msgs(
-                                notice,
-                                uid=f"{kwargs.get('uid')}-timeout",
-                                chat=kwargs.get('chat'),
-                                author=kwargs.get('author'),
-                                type=MsgType.Text,
-                                _is_timeout_notice=True,
-                            )
-                        except Exception:
-                            self.logger.exception("发送投递超时提示失败")
-                    timer = threading.Timer(self._deliver_notice_grace, _grace_expired)
-                    timer.daemon = True
-                    timer.name = "cw-timeout-notice"
-                    timer.start()
+                self._enqueue_deliver_retry(efb_msg, future, kwargs)
             except Exception:
                 self.logger.exception("投递消息到 Telegram 异常: uid=%s", kwargs.get('uid'))
+                self._enqueue_deliver_retry(efb_msg, future, kwargs)
+
+    def _enqueue_deliver_retry(self, efb_msg, future, kwargs):
+        """投递失败后排队重投;超时提示本身(_is_timeout_notice)不重投,避免递归。"""
+        if kwargs.get('_is_timeout_notice'):
+            return
+        label = "type=%s uid=%s" % (getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
+
+        def _orig_done_ok():
+            if not future.done():
+                return False
+            try:
+                return future.exception() is None
+            except Exception:
+                return False
+
+        def _on_exhausted():
+            try:
+                notice = Message()
+                notice.text = "[消息投递超时,请在手机端查看]"
+                self.send_efb_msgs(
+                    notice,
+                    uid=f"{kwargs.get('uid')}-timeout",
+                    chat=kwargs.get('chat'),
+                    author=kwargs.get('author'),
+                    type=MsgType.Text,
+                    _is_timeout_notice=True,
+                )
+            except Exception:
+                self.logger.exception("发送投递超时提示失败")
+
+        self._deliver_retry.submit(
+            deliver=lambda: self._redeliver_to_master(efb_msg),
+            check_done=_orig_done_ok,
+            on_exhausted=_on_exhausted,
+            label=label,
+        )
+
+    def _redeliver_to_master(self, efb_msg):
+        """重投一条消息:浅拷贝 + 独立文件句柄,避免与原投递线程争用同一文件对象。
+        原投递线程的 finally 会关闭原文件句柄;拷贝后按路径重开,互不干扰。
+        本次重投同样受 _deliver_timeout 约束,超时则抛给重投队列继续退避。"""
+        m = copy.copy(efb_msg)
+        f = getattr(m, "file", None)
+        if f is not None:
+            path = getattr(f, "name", None)
+            if isinstance(path, str) and os.path.exists(path):
+                m.file = open(path, "rb")
+            elif getattr(f, "closed", True):
+                raise RuntimeError("媒体临时文件已不存在,无法重投")
+            # 无路径且未关闭:只能共用原文件对象(内存文件),接受读位置风险。
+        future = self._deliver_executor.submit(coordinator.send_message, m)
+        try:
+            future.result(timeout=self._deliver_timeout)
+        finally:
+            try:
+                if m.file:
+                    m.file.close()
+            except Exception:
+                pass
 
     def system_msg(self, content : Dict):
         self.logger.debug(f"system_msg:{content}")
@@ -1574,8 +1611,13 @@ class ComWeChatChannel(SlaveChannel):
     def extract_alias(self, msg):
         sender = msg["sender"]
         extracted = False
-        if "<refermsg>" in msg["message"]:
-            xml = etree.fromstring(msg["message"])
+        if msg.get("message") and "<refermsg>" in msg["message"]:
+            try:
+                xml = etree.fromstring(msg["message"])
+            except Exception:
+                # 引用 XML 损坏是别名整理的小事,绝不能因此中断整条消息投递。
+                self.logger.debug("extract_alias: 引用消息解析失败,跳过")
+                return
             id = xml.xpath('string(/msg/appmsg/refermsg/chatusr)')
             alias = xml.xpath('string(/msg/appmsg/refermsg/displayname)')
             name = self.get_nickname_by_wxid(id)
@@ -1585,20 +1627,30 @@ class ComWeChatChannel(SlaveChannel):
                     id: alias
                 })
 
-        if not extracted and "<atuserlist>" in msg["extrainfo"]:
-            xml = etree.fromstring(msg["extrainfo"])
+        if not extracted and msg.get("extrainfo") and "<atuserlist>" in msg["extrainfo"]:
+            try:
+                xml = etree.fromstring(msg["extrainfo"])
+            except Exception:
+                self.logger.debug("extract_alias: extrainfo 解析失败,跳过")
+                return
             at_user = xml.xpath('string(/msgsource/atuserlist)')
             user_list = [user for user in at_user.split(",") if user]
             if len(user_list) == 1:
+                # 文本里没有 "@名字\u2005" 前缀是常见情况(如引用、转发文本),
+                # 不是错误:直接跳过,不再打印 traceback 噪音。
+                match = re.search("^@(.*)\u2005", msg["message"] or "")
+                if match is None:
+                    return
                 try:
                     name = self.get_nickname_by_wxid(user_list[0])
-                    alias = re.search("^@(.*)\u2005", msg["message"]).group(1)
-                    if alias != name:
-                        self.merge_group_members(sender, {
-                            user_list[0]: alias
-                        })
-                except:
-                    print_exc()
+                except Exception:
+                    self.logger.debug("extract_alias: 取昵称失败,跳过")
+                    return
+                alias = match.group(1)
+                if alias != name:
+                    self.merge_group_members(sender, {
+                        user_list[0]: alias
+                    })
     #定时更新 End
     
     def _detect_wsl(self) -> bool:
