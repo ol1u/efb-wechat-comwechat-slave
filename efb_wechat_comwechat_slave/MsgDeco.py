@@ -164,10 +164,12 @@ def efb_file_wrapper(file: IO, filename: str = None, text: str = None) -> Messag
     mime = magic.from_file(file.name, mime=True)
     if isinstance(mime, bytes):
         mime = mime.decode()
-    # 与 efb_image_wrapper 一致:内容是 GIF 就标 Animation,让 TG 内联播放,
-    # 而不是以文件卡片形式出现;其他类型仍走 File。
+    # 与 efb_image_wrapper 一致:按内容类型决定 TG 里的展示形式,
+    # 让当文件发的图片/动图也能内联显示,而不是文件卡片。
     if "gif" in mime:
         efb_msg.type = MsgType.Animation
+    elif mime.startswith("image/"):
+        efb_msg.type = MsgType.Image
     else:
         efb_msg.type = MsgType.File
     if filename:

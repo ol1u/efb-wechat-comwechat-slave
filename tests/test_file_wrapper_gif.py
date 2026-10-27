@@ -21,6 +21,21 @@ class FileWrapperGifTest(unittest.TestCase):
         self.assertEqual(msg.type, MsgType.Animation)
         self.assertIn("gif", msg.mime)
 
+    def test_jpeg_content_becomes_image(self):
+        # 1x1 JPEG
+        jpeg_1x1 = base64.b64decode(
+            "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////"
+            "2wBDAf//////////////////////////////////////////////////////////////////////////////////////wAARCAABAAEDASIAAhEBAxEB/"
+            "8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAUAQEAAAAAAAAAAAAAAAAAAAAA/"
+            "8QAFBEBAAAAAAAAAAAAAAAAAAAAAP/aAAwDAQACEQMRAD8AvwH/2Q==")
+        with tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False) as f:
+            f.write(jpeg_1x1)
+            path = f.name
+        with open(path, "rb") as fh:
+            msg = efb_file_wrapper(fh, "tmpzk54g62r.jpeg")
+        self.assertEqual(msg.type, MsgType.Image)
+        self.assertIn("jpeg", msg.mime)
+
     def test_non_gif_content_stays_file(self):
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             f.write(b"hello world, this is a plain text file")
