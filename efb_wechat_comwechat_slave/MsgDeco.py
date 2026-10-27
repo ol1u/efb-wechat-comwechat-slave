@@ -349,7 +349,7 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
         elif type == 8:
             efb_msg = Message(
                 type=MsgType.Unsupported,
-                text='未解密表情消息 ，请在手机端查看',
+                text='未解密的微信表情消息，请在微信查看原文',
             )
         elif type == 17:
             msg_title = xml.xpath('/msg/appmsg/title/text()')[0]

@@ -655,7 +655,7 @@ class ComWeChatChannel(SlaveChannel):
         def _on_exhausted():
             try:
                 notice = Message()
-                notice.text = "[消息投递超时,请在手机端查看]"
+                notice.text = "[微信→Telegram 投递超时，请在微信查看原文]"
                 self.send_efb_msgs(
                     notice,
                     uid=f"{kwargs.get('uid')}-timeout",
@@ -792,7 +792,7 @@ class ComWeChatChannel(SlaveChannel):
         except Exception:
             # 单条消息处理失败时降级为文本提示,避免异常上浮拖死接收线程导致后续消息丢失
             self.logger.exception("MsgProcess 处理消息失败,降级为文本提示: type=%s", msg.get("type"))
-            msg['message'] = f"[{msg.get('type')} 接收失败,请在手机端查看]"
+            msg['message'] = f"[{msg.get('type')} 微信→Telegram 接收失败，请在微信查看原文]"
             msg["type"] = "text"
             efb_msgs = MsgProcess(msg, chat)
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
@@ -886,7 +886,7 @@ class ComWeChatChannel(SlaveChannel):
         # 下载超时:降级为文本提示,避免无限等待
         if (int(time.time()) - msg["timestamp"]) > self.time_out:
             self.logger.warning("文件 %s 下载超时,降级为文本提示", path)
-            msg['message'] = f"[{msg['type']} 下载超时,请在手机端查看]"
+            msg['message'] = f"[{msg['type']} 微信→Telegram 下载超时，请在微信查看原文]"
             msg["type"] = "text"
             self._drop_pending_file(path)
             self.send_efb_msgs(MsgWrapper(msg, MsgProcess(msg, chat)), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
@@ -939,7 +939,7 @@ class ComWeChatChannel(SlaveChannel):
             efb_msgs = MsgProcess(msg, chat)
         except Exception:
             self.logger.exception("处理文件消息失败,降级为文本提示: %s", path)
-            msg['message'] = f"[{msg['type']} 接收失败,请在手机端查看]"
+            msg['message'] = f"[{msg['type']} 微信→Telegram 接收失败，请在微信查看原文]"
             msg["type"] = "text"
             efb_msgs = MsgProcess(msg, chat)
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
@@ -1066,7 +1066,7 @@ class ComWeChatChannel(SlaveChannel):
                 if msg.text:
                     caption_reference = self.send_text(chat_uid, msg)
                     if caption_reference is None:
-                        raise EFBMessageError("发送失败，请在手机端确认")
+                        raise EFBMessageError("Telegram→微信发送失败，请在微信确认是否收到")
                     msg.uid = dump_message_ids([media_reference, caption_reference])
                 else:
                     msg.uid = media_reference
@@ -1107,7 +1107,7 @@ class ComWeChatChannel(SlaveChannel):
                 # ogg 损坏/格式异常时之前直接抛异常,整条发送失败且提示含糊。
                 # 改为明确报错,让用户在 TG 看到原因。
                 self.logger.exception("TG 语音转码 mp3 失败")
-                raise EFBMessageError("语音转码失败,请在手机端确认")
+                raise EFBMessageError("Telegram→微信语音转码失败，未发出，请在手机端重发")
             msg.file = f
             msg.file.name = "语音留言.mp3"
             msg.type = MsgType.Video
@@ -1333,7 +1333,7 @@ class ComWeChatChannel(SlaveChannel):
         except Exception:
             send_failed = False  # res 结构异常时不误判,保持原有容错行为
         if send_failed:
-            raise EFBMessageError("发送失败，请在手机端确认")
+            raise EFBMessageError("Telegram→微信发送失败，请在微信确认是否收到")
         # 保存微信 msgid 供撤回/编辑用(移植自上游)
         if msg_ids:
             msg.uid = dump_message_ids(msg_ids)

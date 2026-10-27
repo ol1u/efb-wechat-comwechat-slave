@@ -62,7 +62,7 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
             file = download_file(url)
             return efb_image_wrapper(file)
         except:
-            return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
+            return efb_text_simple_wrapper("[微信表情包下载失败，请在微信查看原文]")
 
     elif msg["type"] == "share":
         # 表情包(share/appmsg type=8):依次尝试 CDN 通道,都不行则快速失败。
@@ -81,7 +81,7 @@ def MsgProcess(msg : dict , chat) -> Union[Message, List[Message]]:
                     return efb_image_wrapper(file)
                 except Exception:
                     continue
-            return efb_text_simple_wrapper("[表情包下载失败,请在手机端查看]")
+            return efb_text_simple_wrapper("[微信表情包下载失败，请在微信查看原文]")
         if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
             file = load_local_file_to_temp(msg["filepath"])
             return efb_file_wrapper(file, os.path.basename(msg["filepath"]))

@@ -138,7 +138,7 @@ class MediaRetryManager:
         )
         failed_msg = dict(msg)
         failed_msg["type"] = "text"
-        failed_msg["message"] = text or f"[{media_type} 下载失败,请在手机端查看]"
+        failed_msg["message"] = text or f"[{media_type} 微信→Telegram 下载失败，请在微信查看原文]"
         messages = MsgProcess(failed_msg, chat, self.channel.direct_transfer)
         commands = MessageCommands([self.command(retry_id)])
         for message in self._as_list(messages):
@@ -440,7 +440,7 @@ class MediaRetryManager:
             self._stop_event.wait(AUTO_RETRY_IDLE_SECONDS)
 
     def _permanent_sticker_failure(self, retry_id, media):
-        text = "动态表情下载链接已失效，无法重试，请在手机端查看。"
+        text = "微信动态表情下载链接已失效，无法重试，请在微信查看原文。"
         try:
             self._edit_failure(media, text)
         except Exception:
@@ -454,7 +454,7 @@ class MediaRetryManager:
 
     def _permanent_media_failure(self, retry_id, media):
         media_name = MEDIA_TYPE_NAMES.get(media.get("type"), "媒体")
-        text = f"{media_name}已被撤回，无法重试，请在手机端查看。"
+        text = f"{media_name}已被撤回，无法重试，请在微信查看原文。"
         try:
             self._edit_failure(media, text)
         except Exception:
