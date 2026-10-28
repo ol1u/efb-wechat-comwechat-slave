@@ -465,6 +465,8 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
         elif type == 51: # 视频（微信视频号分享）
             # 视频号分享的 XML 常常没有 /msg/appmsg/url 节点(视频靠 finderFeed
             # 内部 ID 引用,无网页链接):url 缺失时不再崩,改发文本消息保住内容。
+            # 标注式输出(与 type 1/2 同款):首行说明类型,各字段有无都明说;
+            # 有 url 时仍发链接卡片,标注文本随卡片一起发。
             title_nodes = xml.xpath('/msg/appmsg/title/text()')
             title = title_nodes[0] if title_nodes else "微信视频号分享"
             url_nodes = xml.xpath('/msg/appmsg/url/text()')
@@ -481,7 +483,15 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 nickname = xml.xpath('/msg/appmsg/finderFeed/nickname/text()')[0]
             else:
                 nickname = None
-            result_text += f"微信视频号分享\n - - - - - - - - - - - - - - - \n"
+            label_lines = [
+                "微信分享消息（type=51）",
+                f"标题：{title}",
+                f"描述：{desc or '无'}",
+                f"链接：{url or '无'}",
+                f"作者：{nickname or '无'}",
+                f"头像：{'有' if imgurl else '无'}",
+            ]
+            label_text = "\n".join(label_lines)
             if url:
                 attribute = LinkAttribute(
                     title=title,
@@ -492,18 +502,13 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 efb_msg = Message(
                     attributes=attribute,
                     type=MsgType.Link,
-                    text=result_text,
+                    text=label_text,
                     vendor_specific={ "is_mp": True }
                 )
             else:
-                text = result_text + title
-                if desc:
-                    text += "\n" + desc
-                if nickname:
-                    text += f"\n作者：{nickname}"
                 efb_msg = Message(
                     type=MsgType.Text,
-                    text=text,
+                    text=label_text,
                     vendor_specific={ "is_mp": True }
                 )
         elif type == 57: # 引用（回复）消息
@@ -563,6 +568,9 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 )
         elif type == 63: # 直播（微信视频号分享）
             # 与 type 51 同理:url/headUrl/desc 均可能缺失,缺失时改发文本消息。
+            # 标注式输出(与 type 1/2 同款):首行说明类型,各字段有无都明说;
+            # 有 url 时仍发链接卡片,标注文本随卡片一起发。
+            # 注意:finderLive 无 nickname 字段,故无作者一行。
             title_nodes = xml.xpath('/msg/appmsg/title/text()')
             title = title_nodes[0] if title_nodes else "视频号直播分享"
             url_nodes = xml.xpath('/msg/appmsg/url/text()')
@@ -571,7 +579,14 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
             imgurl = head_nodes[0].strip("<![CDATA[").strip("]]>") if head_nodes else None
             desc_nodes = xml.xpath('/msg/appmsg/finderLive/desc/text()')
             desc = desc_nodes[0].strip("<![CDATA[").strip("]]>") if desc_nodes else None
-            result_text += f"视频号直播分享\n  - - - - - - - - - - - - - - - \n"
+            label_lines = [
+                "微信分享消息（type=63）",
+                f"标题：{title}",
+                f"描述：{desc or '无'}",
+                f"链接：{url or '无'}",
+                f"头像：{'有' if imgurl else '无'}",
+            ]
+            label_text = "\n".join(label_lines)
             if url:
                 attribute = LinkAttribute(
                     title=title,
@@ -582,16 +597,13 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
                 efb_msg = Message(
                     attributes=attribute,
                     type=MsgType.Link,
-                    text=result_text,
+                    text=label_text,
                     vendor_specific={ "is_mp": True }
                 )
             else:
-                text = result_text + title
-                if desc:
-                    text += "\n" + desc
                 efb_msg = Message(
                     type=MsgType.Text,
-                    text=text,
+                    text=label_text,
                     vendor_specific={ "is_mp": True }
                 )
         elif type == 87: # 群公告

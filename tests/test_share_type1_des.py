@@ -75,6 +75,7 @@ for _sub, _attrs in [("ChatMgr", {"ChatMgr": object}),
 
 import importlib
 MsgDeco = importlib.import_module("efb_wechat_comwechat_slave.MsgDeco")
+from ehforwarderbot import MsgType
 
 
 def _wrap(xml: str):
@@ -155,6 +156,84 @@ def test_type1_neither_all_none_plus_hint():
     )
     assert "<?xml" not in msg.text
 
+
+
+
+# 视频号 51/63:与 type 1/2 同款标注式输出;有 url 时仍为链接卡片,标注文本随卡片一起发。
+CH51_NO_URL = """<msg><appmsg><type>51</type><title>测试视频标题</title><finderFeed><nickname>作者名</nickname><desc>视频文案</desc><avatar>http://example.com/a.jpg</avatar></finderFeed></appmsg></msg>"""
+
+CH51_WITH_URL = """<msg><appmsg><type>51</type><title>标题</title><url>http://example.com/v</url><finderFeed><nickname>作者</nickname><desc>文案</desc></finderFeed></appmsg></msg>"""
+
+CH51_URL_NO_DESC = """<msg><appmsg><type>51</type><title>标题</title><url>http://example.com/v</url><finderFeed></finderFeed></appmsg></msg>"""
+
+CH63_NO_URL = """<msg><appmsg><type>63</type><title>直播标题</title><finderLive><desc>直播文案</desc><headUrl>http://example.com/h.jpg</headUrl></finderLive></appmsg></msg>"""
+
+CH63_WITH_URL = """<msg><appmsg><type>63</type><title>直播标题</title><url>http://example.com/live</url><finderLive><desc>文案</desc><headUrl>http://example.com/h.jpg</headUrl></finderLive></appmsg></msg>"""
+
+
+def test_type51_no_url_labeled_text():
+    msg = _wrap(CH51_NO_URL)
+    assert msg.type == MsgType.Text
+    assert msg.text == (
+        "微信分享消息（type=51）\n"
+        "标题：测试视频标题\n"
+        "描述：视频文案\n"
+        "链接：无\n"
+        "作者：作者名\n"
+        "头像：有"
+    )
+
+
+def test_type51_with_url_still_link_with_labeled_text():
+    msg = _wrap(CH51_WITH_URL)
+    assert msg.type == MsgType.Link
+    assert msg.attributes.url == "http://example.com/v"
+    assert msg.text == (
+        "微信分享消息（type=51）\n"
+        "标题：标题\n"
+        "描述：文案\n"
+        "链接：http://example.com/v\n"
+        "作者：作者\n"
+        "头像：无"
+    )
+
+
+def test_type51_url_no_desc_missing_fields_shown_as_none():
+    msg = _wrap(CH51_URL_NO_DESC)
+    assert msg.type == MsgType.Link
+    assert msg.text == (
+        "微信分享消息（type=51）\n"
+        "标题：标题\n"
+        "描述：无\n"
+        "链接：http://example.com/v\n"
+        "作者：无\n"
+        "头像：无"
+    )
+
+
+def test_type63_no_url_labeled_text_no_author_line():
+    msg = _wrap(CH63_NO_URL)
+    assert msg.type == MsgType.Text
+    assert msg.text == (
+        "微信分享消息（type=63）\n"
+        "标题：直播标题\n"
+        "描述：直播文案\n"
+        "链接：无\n"
+        "头像：有"
+    )
+
+
+def test_type63_with_url_still_link_with_labeled_text():
+    msg = _wrap(CH63_WITH_URL)
+    assert msg.type == MsgType.Link
+    assert msg.attributes.url == "http://example.com/live"
+    assert msg.text == (
+        "微信分享消息（type=63）\n"
+        "标题：直播标题\n"
+        "描述：文案\n"
+        "链接：http://example.com/live\n"
+        "头像：有"
+    )
 
 if __name__ == "__main__":
     tests = [(k, v) for k, v in sorted(globals().items())
