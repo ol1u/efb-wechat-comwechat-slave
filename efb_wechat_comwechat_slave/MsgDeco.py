@@ -250,11 +250,23 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
     try:
         type = int(xml.xpath('/msg/appmsg/type/text()')[0])
         if type in [ 1 , 2 ]:
-            title = xml.xpath('/msg/appmsg/title/text()')[0]
-            des = xml.xpath('/msg/appmsg/des/text()')[0]
+            # title/des 均可能缺失(实测:仅 title 无 des 的分享会走兜底原样发 XML):
+            # 缺失时判空,绝不因 [0] 抛错;两者皆无时给明确提示,不发空消息、不发原 XML。
+            title_nodes = xml.xpath('/msg/appmsg/title/text()')
+            title = title_nodes[0] if title_nodes else ""
+            des_nodes = xml.xpath('/msg/appmsg/des/text()')
+            des = des_nodes[0] if des_nodes else ""
+            if title and des and des != title:
+                text = title + " :\n" + des
+            elif title:
+                text = title
+            elif des:
+                text = des
+            else:
+                text = "[微信→Telegram 分享消息解析失败，请在微信查看原文]"
             efb_msg = Message(
                 type = MsgType.Text,
-                text = title if title==des else title+" :\n"+des,
+                text = text,
             )
         elif type == 3: #音乐分享
             try:
