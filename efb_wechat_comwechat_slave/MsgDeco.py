@@ -250,23 +250,29 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
     try:
         type = int(xml.xpath('/msg/appmsg/type/text()')[0])
         if type in [ 1 , 2 ]:
-            # title/des 均可能缺失(实测:仅 title 无 des 的分享会走兜底原样发 XML):
-            # 缺失时判空,绝不因 [0] 抛错;两者皆无时给明确提示,不发空消息、不发原 XML。
+            # 标注式输出:一眼能看出这是分享消息及 type,各字段有无都明说。
+            # type 数值只照实写,不写旧注释的“百度网盘”等对应关系——
+            # 实测 B站分享也是 type 1,旧对应关系不可靠。
             title_nodes = xml.xpath('/msg/appmsg/title/text()')
             title = title_nodes[0] if title_nodes else ""
             des_nodes = xml.xpath('/msg/appmsg/des/text()')
             des = des_nodes[0] if des_nodes else ""
-            if title and des and des != title:
-                text = title + " :\n" + des
-            elif title:
-                text = title
-            elif des:
-                text = des
-            else:
-                text = "[微信→Telegram 分享消息解析失败，请在微信查看原文]"
+            url_nodes = xml.xpath('/msg/appmsg/url/text()')
+            url = url_nodes[0] if url_nodes else ""
+            app_nodes = xml.xpath('/msg/appinfo/appname/text()')
+            app = app_nodes[0] if app_nodes else ""
+            lines = [
+                f"微信分享消息（type={type}）",
+                f"标题：{title or '无'}",
+                f"描述：{des or '无'}",
+                f"链接：{url or '无'}",
+                f"来源：{app or '无'}",
+            ]
+            if not title and not des and not url:
+                lines.append("（无可用内容，请在微信查看原文）")
             efb_msg = Message(
                 type = MsgType.Text,
-                text = text,
+                text = "\n".join(lines),
             )
         elif type == 3: #音乐分享
             try:

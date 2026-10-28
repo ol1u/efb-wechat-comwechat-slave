@@ -1,4 +1,7 @@
-"""type 1/2 分享消息 des 缺失回归测试(2026-10-28:好名字分享在 TG 成原 XML)。
+"""type 1/2 分享消息标注式输出测试(2026-10-28:好名字分享在 TG 成原 XML)。
+
+第一版修 des 缺失判空;第二版(本文件)改为标注式输出:首行说明是分享消息
+及 type,标题/描述/链接/来源各字段有无都明说,不再只发裸标题。
 
 MsgDeco 依赖 ehforwarderbot;无该依赖时用轻量桩模块代替,
 只测 efb_share_link_wrapper 的纯解析分支,不触通道逻辑。
@@ -78,11 +81,12 @@ def _wrap(xml: str):
     return MsgDeco.efb_share_link_wrapper({"message": xml}, chat=None)
 
 
+# 好名字 20:26 那条的形状:有 title 与来源,无 des、无 url。
 TYPE1_TITLE_ONLY = """<?xml version="1.0"?>
-<msg><appmsg><title>适配快还是降价快？iPhone Duo、华为Pura X Max - https://www.bilibili.com/video/BV1ebxM61EkQ/</title><type>1</type><appinfo><appname>哔哩哔哩</appname></appinfo></appmsg></msg>"""
+<msg><appmsg><title>适配快还是降价快？iPhone Duo、华为Pura X Max - https://www.bilibili.com/video/BV1ebxM61EkQ/</title><type>1</type></appmsg><appinfo><appname>哔哩哔哩</appname></appinfo></msg>"""
 
-TYPE1_TITLE_DES = """<?xml version="1.0"?>
-<msg><appmsg><title>标题A</title><des>描述B</des><type>1</type></appmsg></msg>"""
+TYPE1_FULL = """<?xml version="1.0"?>
+<msg><appmsg><title>标题A</title><des>描述B</des><url>https://example.com/x</url><type>1</type></appmsg><appinfo><appname>某应用</appname></appinfo></msg>"""
 
 TYPE1_TITLE_EQ_DES = """<?xml version="1.0"?>
 <msg><appmsg><title>同款</title><des>同款</des><type>1</type></appmsg></msg>"""
@@ -94,31 +98,61 @@ TYPE1_NEITHER = """<?xml version="1.0"?>
 <msg><appmsg><type>1</type></appmsg></msg>"""
 
 
-def test_type1_title_only_returns_title_not_raw_xml():
+def test_type1_title_only_labeled_not_raw_xml():
     msg = _wrap(TYPE1_TITLE_ONLY)
-    assert "适配快还是降价快" in msg.text
+    assert msg.text == (
+        "微信分享消息（type=1）\n"
+        "标题：适配快还是降价快？iPhone Duo、华为Pura X Max - https://www.bilibili.com/video/BV1ebxM61EkQ/\n"
+        "描述：无\n"
+        "链接：无\n"
+        "来源：哔哩哔哩"
+    )
     assert "<?xml" not in msg.text
-    assert "bilibili.com/video/BV1ebxM61EkQ" in msg.text
 
 
-def test_type1_title_des_joined():
-    msg = _wrap(TYPE1_TITLE_DES)
-    assert msg.text == "标题A :\n描述B"
+def test_type1_full_all_fields_shown():
+    msg = _wrap(TYPE1_FULL)
+    assert msg.text == (
+        "微信分享消息（type=1）\n"
+        "标题：标题A\n"
+        "描述：描述B\n"
+        "链接：https://example.com/x\n"
+        "来源：某应用"
+    )
 
 
-def test_type1_title_eq_des_single():
+def test_type1_title_eq_des_both_lines_shown():
     msg = _wrap(TYPE1_TITLE_EQ_DES)
-    assert msg.text == "同款"
+    assert msg.text == (
+        "微信分享消息（type=1）\n"
+        "标题：同款\n"
+        "描述：同款\n"
+        "链接：无\n"
+        "来源：无"
+    )
 
 
-def test_type2_title_only():
+def test_type2_header_shows_type_2():
     msg = _wrap(TYPE2_TITLE_ONLY)
-    assert msg.text == "仅标题"
+    assert msg.text == (
+        "微信分享消息（type=2）\n"
+        "标题：仅标题\n"
+        "描述：无\n"
+        "链接：无\n"
+        "来源：无"
+    )
 
 
-def test_type1_neither_gives_notice_not_empty_not_xml():
+def test_type1_neither_all_none_plus_hint():
     msg = _wrap(TYPE1_NEITHER)
-    assert msg.text
+    assert msg.text == (
+        "微信分享消息（type=1）\n"
+        "标题：无\n"
+        "描述：无\n"
+        "链接：无\n"
+        "来源：无\n"
+        "（无可用内容，请在微信查看原文）"
+    )
     assert "<?xml" not in msg.text
 
 
