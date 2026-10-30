@@ -115,6 +115,19 @@ class OpenIMMediaDownloadTest(unittest.TestCase):
                 {"type": "voice", "msgid": "123"},
             )
 
+    def test_legacy_native_failure_exposes_full_response(self):
+        bot = Mock()
+        bot.GetVoiceMsg.return_value = {
+            "msg": 0,
+            "result": "OK",
+        }
+
+        with self.assertRaisesRegex(OpenIMMediaError, "'msg': 0"):
+            download_openim_media(
+                bot,
+                {"type": "voice", "msgid": "123"},
+            )
+
 
 class WindowsPathConversionTest(unittest.TestCase):
     @patch.object(
