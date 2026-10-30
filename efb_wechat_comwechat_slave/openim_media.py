@@ -67,10 +67,14 @@ def _response_path(response: Any, media_type: str) -> str:
         raise OpenIMMediaError(
             "{} download returned an invalid response".format(media_type)
         )
-    if str(response.get("msg")) != "1" or response.get("result") != "OK":
-        detail = response.get("err_msg") or response.get("result") or response
+    if str(response.get("msg")) != "1":
+        detail = response.get("err_msg") or response
         raise OpenIMMediaError(
             "{} download failed: {}".format(media_type, detail)
+        )
+    if response.get("result") != "OK":
+        raise OpenIMMediaError(
+            "{} download failed: {}".format(media_type, response)
         )
     path = response.get("path")
     if not isinstance(path, str) or not path.strip():

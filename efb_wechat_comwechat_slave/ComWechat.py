@@ -92,9 +92,34 @@ class ComWeChatChannel(SlaveChannel):
         self.api_host = self.config.get("api_host", "127.0.0.1")
         self.api_port = self.config.get("api_port", 18888)
         self.api_base_url = f"http://{self.api_host}:{self.api_port}"
+        # 企业微信媒体可走独立 Hook 实例。默认沿用 api_host/api_port，
+        # 仅在配置 media_api_port 时启用双端口部署。
+        self.media_api_host = self.config.get("media_api_host", self.api_host)
+        self.media_api_port = int(
+            self.config.get("media_api_port") or self.api_port
+        )
 
         # 配置WeChatRobot实例使用自定义host和port
         self.bot = WeChatRobot(ip="0.0.0.0", port=23456, api_host=self.api_host, api_port=self.api_port)
+        if (
+            self.media_api_host == self.api_host
+            and self.media_api_port == int(self.api_port)
+        ):
+            self.media_bot = self.bot
+        else:
+            self.media_bot = WeChatRobot(
+                ip="0.0.0.0",
+                port=23456,
+                api_host=self.media_api_host,
+                api_port=self.media_api_port,
+            )
+        self.logger.info(
+            "ComWechat API: %s:%s; OpenIM media API: %s:%s",
+            self.api_host,
+            self.api_port,
+            self.media_api_host,
+            self.media_api_port,
+        )
 
         self.wxid = None
         # 入站投递线程池:Hook 回调只做轻量投递,不在回调线程里阻塞。
@@ -766,7 +791,7 @@ class ComWeChatChannel(SlaveChannel):
             media_type = msg["type"]
             try:
                 local_path = download_openim_media(
-                    self.bot,
+                    self.media_bot,
                     msg,
                     is_wsl=getattr(self, "is_wsl", False),
                 )

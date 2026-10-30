@@ -100,9 +100,16 @@
    # 可选: 自定义ComWeChatRobot HTTP API的连接地址 (默认: 127.0.0.1:18888)
    # api_host: "127.0.0.1"
    # api_port: 18888
+   # 可选: 企业微信语音/动态表情使用独立媒体 Hook 端口。
+   # 不配置时沿用 api_host/api_port，现有单端口部署无需修改。
+   # media_api_host: "127.0.0.1"
+   # media_api_port: 18892
    ```
 
    > **关于路径**：WSL 会自动将 Windows 的盘符挂载到 `/mnt/` 目录下。例如，Windows 中的 `C:\Users\yourusername` 路径在 WSL 2 中对应为 `/mnt/c/Users/yourusername`。请根据你的实际情况修改 `dir` 配置中的路径。注意，路径中的空格需要使用反斜杠 `\` 进行转义。由于微信在 Windows 中的默认存放路径为 `文档/WeChat Files`，这里以默认路径作为演示。
+   >
+   > 如果 `api_port` 使用稳定版 Hook 处理消息和数据库，而 `media_api_port`
+   > 使用包含 `type=53/54` 的增强版 Hook，请确保两个端口注入到同一个微信进程。
 
 ## 实现 Windows 端对微信的 Hook
 
