@@ -131,3 +131,15 @@
    ```
 
    启动后，日志会显示从端已经根据 `dir` 中填写的 WSL 路径，将 Hook 路径自动映射为 Windows 路径。此时测试相关功能是否正常。
+
+## 企业微信语音和动态表情
+
+企业微信联系人（`@openim`）的语音和动态表情不走私人微信的本地文件、
+`MediaMSG` 数据库或 `cdnurl` 流程。从端会把消息 `msgid` 和原始 XML 交给
+增强版 Native Hook 的 `type=53` / `type=54` 接口直接下载，再把返回的
+Windows 路径转换成 WSL 路径发送到 Telegram。私人微信的语音和表情逻辑不变。
+
+使用前请确认 Windows 端运行的是包含 `GetVoiceMsg` / `GetEmojiMsg` 的
+增强版 Hook。语音通常以 `.silk` 形式返回，再由从端转换为 Telegram
+可播放的 Ogg/Opus；动态表情按下载到的实际格式（GIF/PNG/JPEG/WebP/AVIF）
+作为图片或动画发送。
