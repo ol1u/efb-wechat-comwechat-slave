@@ -33,12 +33,13 @@ from ehforwarderbot.status import MessageRemoval, ChatUpdates
 
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
-from .MsgDeco import qutoed_text
+from .MsgDeco import qutoed_text, efb_image_wrapper, efb_text_simple_wrapper
 from .MsgProcess import MsgProcess, MsgWrapper
-from .Utils import download_file , load_config , load_temp_file_to_local , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference
+from .Utils import download_file , load_config , load_temp_file_to_local , load_local_file_to_temp , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference
 from .db import DatabaseManager
 from .delivery_retry import DeliveryRetryQueue
 from .Constant import QUOTE_MESSAGE
+from .openim_media import download_openim_media, is_openim_media_message
 
 from rich.console import Console
 from rich import print as rprint
@@ -757,6 +758,43 @@ class ComWeChatChannel(SlaveChannel):
         else:
             if self.cache[msg["msgid"]] == msg["type"]:
                 return
+
+        # Enterprise WeCom media is not stored in the personal-WeChat media
+        # databases and may have an empty local filepath. Native type 53/54
+        # downloads it directly from the original @openim message.
+        if is_openim_media_message(msg):
+            media_type = msg["type"]
+            try:
+                local_path = download_openim_media(
+                    self.bot,
+                    msg,
+                    is_wsl=getattr(self, "is_wsl", False),
+                )
+                msg["filepath"] = local_path
+                if media_type == "voice":
+                    efb_msgs = MsgProcess(msg, chat)
+                else:
+                    efb_msgs = efb_image_wrapper(
+                        load_local_file_to_temp(local_path)
+                    )
+            except Exception:
+                self.logger.exception(
+                    "企业微信媒体下载失败: type=%s msgid=%s",
+                    media_type,
+                    msg.get("msgid"),
+                )
+                msg["filepath"] = ""
+                media_name = "语音" if media_type == "voice" else "表情包"
+                efb_msgs = efb_text_simple_wrapper(
+                    "[企业微信{}下载失败，请在微信查看原文]".format(media_name)
+                )
+            self.send_efb_msgs(
+                MsgWrapper(msg, efb_msgs),
+                author=author,
+                chat=chat,
+                uid=MessageID(str(msg["msgid"])),
+            )
+            return
 
         try:
             if ("FileStorage" in msg["filepath"]) and ("Cache" not in msg["filepath"]):
