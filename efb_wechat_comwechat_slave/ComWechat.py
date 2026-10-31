@@ -1,6 +1,7 @@
 import logging, tempfile
 import time
 import threading
+import requests
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from lxml import etree
 from traceback import print_exc
@@ -39,7 +40,11 @@ from .Utils import download_file , load_config , load_temp_file_to_local , load_
 from .db import DatabaseManager
 from .delivery_retry import DeliveryRetryQueue
 from .Constant import QUOTE_MESSAGE
-from .openim_media import download_openim_media, is_openim_media_message
+from .openim_media import (
+    download_openim_media,
+    is_openim_media_message,
+    windows_to_wsl_path,
+)
 
 from rich.console import Console
 from rich import print as rprint
@@ -636,8 +641,14 @@ class ComWeChatChannel(SlaveChannel):
         efb_msgs = [efb_msgs] if isinstance(efb_msgs, Message) else efb_msgs
         if 'deliver_to' not in kwargs:
             kwargs['deliver_to'] = coordinator.master
-        for efb_msg in efb_msgs:
-            for k, v in kwargs.items():
+        for index, efb_msg in enumerate(efb_msgs):
+            msg_kwargs = kwargs
+            if len(efb_msgs) > 1 and kwargs.get("uid") is not None:
+                msg_kwargs = dict(kwargs)
+                msg_kwargs["uid"] = MessageID(
+                    "{}-{}".format(kwargs["uid"], index + 1)
+                )
+            for k, v in msg_kwargs.items():
                 setattr(efb_msg, k, v)
             # 投递到 master(最终调 Telegram 接口)可能因网络问题 hanging,
             # 用超时隔离:超时即放弃该条并记 ERROR,不让它卡住整条流水线。
@@ -658,11 +669,11 @@ class ComWeChatChannel(SlaveChannel):
             except FuturesTimeoutError:
                 self.logger.error(
                     "投递消息到 Telegram 超时(%ss),已进入重投队列: type=%s uid=%s",
-                    self._deliver_timeout, getattr(efb_msg, 'type', '?'), kwargs.get('uid'))
-                self._enqueue_deliver_retry(efb_msg, future, kwargs)
+                    self._deliver_timeout, getattr(efb_msg, 'type', '?'), msg_kwargs.get('uid'))
+                self._enqueue_deliver_retry(efb_msg, future, msg_kwargs)
             except Exception:
-                self.logger.exception("投递消息到 Telegram 异常: uid=%s", kwargs.get('uid'))
-                self._enqueue_deliver_retry(efb_msg, future, kwargs)
+                self.logger.exception("投递消息到 Telegram 异常: uid=%s", msg_kwargs.get('uid'))
+                self._enqueue_deliver_retry(efb_msg, future, msg_kwargs)
 
     def _enqueue_deliver_retry(self, efb_msg, future, kwargs):
         """投递失败后排队重投;超时提示本身(_is_timeout_notice)不重投,避免递归。"""
@@ -852,13 +863,21 @@ class ComWeChatChannel(SlaveChannel):
             return
 
         try:
-            efb_msgs = MsgProcess(msg, chat)
+            efb_msgs = MsgProcess(
+                msg,
+                chat,
+                forwarded_media_resolver=self._resolve_forwarded_media,
+            )
         except Exception:
             # 单条消息处理失败时降级为文本提示,避免异常上浮拖死接收线程导致后续消息丢失
             self.logger.exception("MsgProcess 处理消息失败,降级为文本提示: type=%s", msg.get("type"))
             msg['message'] = f"[{msg.get('type')} 微信→Telegram 接收失败，请在微信查看原文]"
             msg["type"] = "text"
-            efb_msgs = MsgProcess(msg, chat)
+            efb_msgs = MsgProcess(
+                msg,
+                chat,
+                forwarded_media_resolver=self._resolve_forwarded_media,
+            )
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
     def _drop_pending_file(self, path: str):
@@ -982,7 +1001,19 @@ class ComWeChatChannel(SlaveChannel):
             msg['message'] = f"[{msg['type']} 微信→Telegram 下载超时，请在微信查看原文]"
             msg["type"] = "text"
             self._drop_pending_file(path)
-            self.send_efb_msgs(MsgWrapper(msg, MsgProcess(msg, chat)), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
+            self.send_efb_msgs(
+                MsgWrapper(
+                    msg,
+                    MsgProcess(
+                        msg,
+                        chat,
+                        forwarded_media_resolver=self._resolve_forwarded_media,
+                    ),
+                ),
+                author=author,
+                chat=chat,
+                uid=MessageID(str(msg['msgid'])),
+            )
             return
 
         # 语音:文件未出现时尝试从数据库提取音频数据,轮询全部 MediaMSG 分片
@@ -1029,12 +1060,20 @@ class ComWeChatChannel(SlaveChannel):
 
         self._drop_pending_file(path)
         try:
-            efb_msgs = MsgProcess(msg, chat)
+            efb_msgs = MsgProcess(
+                msg,
+                chat,
+                forwarded_media_resolver=self._resolve_forwarded_media,
+            )
         except Exception:
             self.logger.exception("处理文件消息失败,降级为文本提示: %s", path)
             msg['message'] = f"[{msg['type']} 微信→Telegram 接收失败，请在微信查看原文]"
             msg["type"] = "text"
-            efb_msgs = MsgProcess(msg, chat)
+            efb_msgs = MsgProcess(
+                msg,
+                chat,
+                forwarded_media_resolver=self._resolve_forwarded_media,
+            )
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
     def handle_file_msg(self):
@@ -1060,6 +1099,79 @@ class ComWeChatChannel(SlaveChannel):
             except Exception:
                 self.logger.exception("handle_file_msg 主循环异常,稍后继续")
             time.sleep(1)
+
+    def _hook_path_to_local(self, path: str) -> str:
+        """Map a Windows path returned by the hook to this host's filesystem."""
+        if not isinstance(path, str) or not path.strip():
+            return path
+        base_path = getattr(self, "base_path", None)
+        local_dir = getattr(self, "dir", None)
+        if base_path and local_dir:
+            normalized_path = path.replace("/", "\\")
+            normalized_base = str(base_path).replace("/", "\\").rstrip("\\")
+            if normalized_path.lower().startswith(normalized_base.lower()):
+                relative = normalized_path[len(normalized_base):].lstrip("\\")
+                return os.path.join(local_dir, relative.replace("\\", os.sep))
+        return windows_to_wsl_path(path, bool(getattr(self, "is_wsl", False)))
+
+    def GetMsgCdn(self, msgid) -> str:
+        """Download one image, video or file through hook API type 47."""
+        original_msgid = msgid
+        msgid = str(msgid)
+        if getattr(self.bot, "api_host", None) and getattr(self.bot, "api_port", None):
+            # Older python-comwechatrobot-http releases typed msgid as int,
+            # losing precision for these 19-digit IDs. Send the JSON manually.
+            response = requests.post(
+                "http://{}:{}/api/?type=47".format(
+                    self.bot.api_host,
+                    self.bot.api_port,
+                ),
+                data=json.dumps({"msgid": msgid}),
+                timeout=90,
+            ).json()
+        else:
+            response = self.bot.GetCdn(msgid=original_msgid)
+        if not isinstance(response, dict):
+            raise RuntimeError("type 47 returned an invalid response")
+        if response.get("result") != "OK" or str(response.get("msg")) != "1":
+            detail = response.get("err_msg") or response
+            raise RuntimeError("type 47 download failed: {}".format(detail))
+        path = self._hook_path_to_local(response.get("path") or "")
+        if not path:
+            raise RuntimeError("type 47 returned no path")
+        return path
+
+    def _resolve_forwarded_media(self, item: Dict[str, Any]):
+        """Resolve one media child in a merged-forward record."""
+        for candidate in item.get("local_paths") or []:
+            path = self._hook_path_to_local(candidate)
+            if os.path.isfile(path):
+                return path
+
+        errors = []
+        for msgid in item.get("msgids") or []:
+            try:
+                path = self.GetMsgCdn(msgid)
+                deadline = time.monotonic() + 15
+                while time.monotonic() < deadline:
+                    if os.path.isfile(path) and os.path.getsize(path) > 0:
+                        return path
+                    time.sleep(0.25)
+                raise FileNotFoundError(path)
+            except Exception as exc:
+                errors.append("{}: {}".format(msgid, exc))
+
+        for url in item.get("http_urls") or []:
+            try:
+                return download_file(url, retry=2, retry_interval=0.5)
+            except Exception as exc:
+                errors.append("{}: {}".format(url[:120], exc))
+
+        raise FileNotFoundError(
+            "forwarded media unavailable: {}".format(
+                "; ".join(errors) or "no msgid or downloadable URL"
+            )
+        )
 
     def process_friend_request(self , v3 , v4):
         self.logger.debug(f"process_friend_request:{v3} {v4}")
