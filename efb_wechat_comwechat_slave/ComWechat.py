@@ -40,6 +40,11 @@ from .Utils import download_file , load_config , load_temp_file_to_local , load_
 from .db import DatabaseManager
 from .delivery_retry import DeliveryRetryQueue
 from .Constant import QUOTE_MESSAGE
+from .forwarded_media_cache import (
+    ForwardedMediaCache,
+    ForwardedMediaResolution,
+    ForwardedMediaUnavailable,
+)
 from .openim_media import (
     download_openim_media,
     is_openim_media_message,
@@ -53,6 +58,50 @@ from PIL import Image
 
 # 语音数据库分片名(兜底用,实际以 hook 上报的句柄列表为准;移植自上游 b278d27)
 VOICE_DATABASE_NAMES = ("MediaMSG0.db", "MediaMSG1.db", "MediaMSG2.db")
+
+FORWARDED_MEDIA_CACHE_RELATIVE_ROOTS = (
+    os.path.join("FileStorage", "MsgAttach"),
+    os.path.join("FileStorage", "Cache"),
+    os.path.join("FileStorage", "Fav"),
+    os.path.join("FileStorage", "General"),
+    os.path.join("FileStorage", "Temp"),
+    os.path.join("FileStorage", "TempFromPhone"),
+    os.path.join("FileStorage", "Image"),
+    os.path.join("FileStorage", "Video"),
+    os.path.join("FileStorage", "File"),
+    os.path.join("MsgAttach", "FileStorage"),
+    "MsgAttach",
+    "Cache",
+    "Image",
+    "Video",
+    "File",
+    os.path.join("msg", "file"),
+    os.path.join("msg", "attach"),
+    os.path.join("msg", "image"),
+    os.path.join("msg", "video"),
+    "msg",
+)
+FORWARDED_IMAGE_EXTENSIONS = (
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".webp",
+    ".bmp",
+    ".heic",
+    ".dat",
+    ".bin",
+)
+FORWARDED_VIDEO_EXTENSIONS = (
+    ".mp4",
+    ".mov",
+    ".mkv",
+    ".avi",
+    ".webm",
+    ".m4v",
+    ".dat",
+    ".bin",
+)
 
 class ComWeChatChannel(SlaveChannel):
     channel_name : str = "ComWechatChannel"
@@ -137,6 +186,9 @@ class ComWeChatChannel(SlaveChannel):
         self._deliver_retry = DeliveryRetryQueue()
         self._file_probe: Dict[str, Tuple[int, float]] = {}  # {path: (size, 首次观测时间)} 文件就绪探测
         self._voice_db_names: Optional[List[str]] = None  # 语音库分片名缓存,移植自上游 b278d27
+        self._forwarded_media_cache: Optional[ForwardedMediaCache] = None
+        self._forwarded_media_cache_roots: Tuple[str, ...] = ()
+        self._forwarded_media_cache_lock = threading.Lock()
         # 撤回/编辑支持(移植自上游 a847ad3/aca50dc)
         self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text): Event} 等待 hook 回传 msgid
         self.sent_msg_results: Dict[Any, MessageID] = {}
@@ -656,6 +708,8 @@ class ComWeChatChannel(SlaveChannel):
             # 这是为保住流水线而接受的代价,概率极低。
             def _deliver(m):
                 try:
+                    if getattr(m, "file", None):
+                        m.file.seek(0)
                     coordinator.send_message(m)
                 finally:
                     try:
@@ -716,14 +770,18 @@ class ComWeChatChannel(SlaveChannel):
         原投递线程的 finally 会关闭原文件句柄;拷贝后按路径重开,互不干扰。
         本次重投同样受 _deliver_timeout 约束,超时则抛给重投队列继续退避。"""
         m = copy.copy(efb_msg)
-        f = getattr(m, "file", None)
+        f = getattr(efb_msg, "file", None)
         if f is not None:
             path = getattr(f, "name", None)
             if isinstance(path, str) and os.path.exists(path):
                 m.file = open(path, "rb")
             elif getattr(f, "closed", True):
                 raise RuntimeError("媒体临时文件已不存在,无法重投")
-            # 无路径且未关闭:只能共用原文件对象(内存文件),接受读位置风险。
+            else:
+                # 无路径且未关闭:只能共用原文件对象(内存文件),接受读位置风险。
+                m.file = f
+        if getattr(m, "file", None):
+            m.file.seek(0)
         future = self._deliver_executor.submit(coordinator.send_message, m)
         try:
             future.result(timeout=self._deliver_timeout)
@@ -1141,37 +1199,345 @@ class ComWeChatChannel(SlaveChannel):
             raise RuntimeError("type 47 returned no path")
         return path
 
-    def _resolve_forwarded_media(self, item: Dict[str, Any]):
-        """Resolve one media child in a merged-forward record."""
-        for candidate in item.get("local_paths") or []:
-            path = self._hook_path_to_local(candidate)
-            if os.path.isfile(path):
-                return path
+    def _forwarded_media_cache_directories(self) -> Tuple[str, ...]:
+        """Return narrowly scoped WeChat media roots for the logged-in account."""
+        wxid = str(getattr(self, "wxid", "") or "").strip()
+        if not wxid or os.path.basename(wxid) != wxid:
+            return ()
 
-        errors = []
+        configured_roots = []
+        for value in (
+            getattr(self, "dir", None),
+            getattr(self, "base_path", None),
+        ):
+            if not value:
+                continue
+            try:
+                local_value = self._hook_path_to_local(str(value))
+            except Exception:
+                continue
+            if local_value and local_value not in configured_roots:
+                configured_roots.append(local_value)
+
+        candidates = []
+        account_roots = []
+        for configured_root in configured_roots:
+            if os.path.basename(configured_root) == wxid:
+                possible_roots = (configured_root,)
+            else:
+                possible_roots = (os.path.join(configured_root, wxid),)
+            for account_root in possible_roots:
+                if os.path.isdir(account_root):
+                    normalized = os.path.realpath(account_root)
+                    if normalized not in account_roots:
+                        account_roots.append(normalized)
+
+        for account_root in account_roots:
+            account_candidates = []
+            for relative in FORWARDED_MEDIA_CACHE_RELATIVE_ROOTS:
+                candidate = os.path.realpath(
+                    os.path.join(account_root, relative)
+                )
+                if os.path.isdir(candidate):
+                    account_candidates.append(candidate)
+            if not account_candidates:
+                file_storage = os.path.join(account_root, "FileStorage")
+                account_candidates.append(
+                    os.path.realpath(
+                        file_storage
+                        if os.path.isdir(file_storage)
+                        else account_root
+                    )
+                )
+            candidates.extend(account_candidates)
+
+        # MatchAttach contains most WeChat 4.x media.  If a broad fallback was
+        # also discovered, keep only its scoped descendants.
+        unique_candidates = list(dict.fromkeys(candidates))
+        result = []
+        for candidate in unique_candidates:
+            if any(
+                other != candidate
+                and other.startswith(candidate + os.sep)
+                for other in unique_candidates
+            ):
+                continue
+            result.append(candidate)
+        return tuple(result)
+
+    def _get_forwarded_media_cache(self) -> Optional[ForwardedMediaCache]:
+        roots = self._forwarded_media_cache_directories()
+        if not roots:
+            return None
+        with self._forwarded_media_cache_lock:
+            if (
+                self._forwarded_media_cache is not None
+                and roots == self._forwarded_media_cache_roots
+            ):
+                return self._forwarded_media_cache
+            try:
+                self._forwarded_media_cache = ForwardedMediaCache(
+                    roots,
+                    max_depth=8,
+                    max_files=30000,
+                    max_scan_seconds=3.0,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "合并转发媒体缓存扫描器初始化失败: %s",
+                    type(exc).__name__,
+                )
+                self._forwarded_media_cache = None
+            self._forwarded_media_cache_roots = roots
+            return self._forwarded_media_cache
+
+    @staticmethod
+    def _forwarded_media_profile(item: Dict[str, Any]):
+        datatype = str(item.get("datatype") or "")
+        if datatype == "2" or item.get("emoji_urls"):
+            return "image", FORWARDED_IMAGE_EXTENSIONS
+        if datatype == "4":
+            return "video", FORWARDED_VIDEO_EXTENSIONS
+        if datatype == "8":
+            extension = str(item.get("datafmt") or "").strip().lstrip(".").lower()
+            if re.fullmatch(r"[a-z0-9]{1,12}", extension):
+                return "file", (".{}".format(extension), ".dat", ".bin")
+            return "file", None
+        return "file", None
+
+    @staticmethod
+    def _forwarded_expected_size(value: Any) -> Optional[int]:
+        try:
+            size = int(str(value).strip())
+        except (TypeError, ValueError):
+            return None
+        return size if size > 0 else None
+
+    @staticmethod
+    def _forwarded_expected_md5(value: Any) -> Optional[str]:
+        digest = str(value or "").strip().lower()
+        return digest if re.fullmatch(r"[0-9a-f]{32}", digest) else None
+
+    @staticmethod
+    def _forwarded_download_suffix(item: Dict[str, Any]) -> str:
+        extension = str(item.get("datafmt") or "").strip().lstrip(".").lower()
+        if re.fullmatch(r"[a-z0-9]{1,12}", extension):
+            return ".{}".format(extension)
+        return ".bin"
+
+    def _download_forwarded_media_url(
+        self,
+        url: str,
+        *,
+        expected_size: Optional[int],
+        expected_md5: Optional[str],
+        suffix: str = ".bin",
+    ):
+        """Download and, when metadata exists, validate a real HTTP media URL."""
+        last_error = None
+        for attempt in range(2):
+            response = None
+            output = None
+            try:
+                response = requests.get(
+                    url,
+                    stream=True,
+                    timeout=(5, 30),
+                )
+                if response.status_code != 200:
+                    raise ValueError("unexpected HTTP status")
+                output = tempfile.NamedTemporaryFile(
+                    prefix="efb-forwarded-",
+                    suffix=suffix,
+                    delete=True,
+                )
+                digest = hashlib.md5(usedforsecurity=False)
+                size = 0
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    output.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+                if size <= 0:
+                    raise ValueError("empty HTTP media response")
+                if expected_size is not None and size != expected_size:
+                    raise ValueError("media size mismatch")
+                if expected_md5 is not None and digest.hexdigest() != expected_md5:
+                    raise ValueError("media MD5 mismatch")
+                output.seek(0)
+                return output
+            except Exception as exc:
+                last_error = exc
+                if output is not None:
+                    output.close()
+                if attempt == 0:
+                    time.sleep(0.5)
+            finally:
+                if response is not None:
+                    response.close()
+        raise ForwardedMediaUnavailable(
+            "媒体地址不可用或内容校验失败"
+        ) from last_error
+
+    def _resolve_forwarded_media(self, item: Dict[str, Any]):
+        """Resolve one media child in a merged-forward record.
+
+        Resolution order is local path, hook type 47, exact local-cache match,
+        then a real HTTP URL.  Thumbnail matches are explicitly marked and are
+        never presented as the original media.
+        """
+        for candidate in item.get("local_paths") or []:
+            try:
+                path = self._hook_path_to_local(candidate)
+                if os.path.isfile(path) and os.path.getsize(path) > 0:
+                    media_type, _ = self._forwarded_media_profile(item)
+                    return ForwardedMediaResolution(
+                        source=path,
+                        media_type=media_type,
+                    )
+            except (OSError, ValueError):
+                continue
+
+        expected_size = self._forwarded_expected_size(item.get("datasize"))
+        hook_failed = False
         for msgid in item.get("msgids") or []:
             try:
                 path = self.GetMsgCdn(msgid)
                 deadline = time.monotonic() + 15
+                previous_size = -1
+                stable_checks = 0
                 while time.monotonic() < deadline:
-                    if os.path.isfile(path) and os.path.getsize(path) > 0:
-                        return path
+                    try:
+                        current_size = os.path.getsize(path)
+                    except OSError:
+                        current_size = 0
+                    if current_size > 0:
+                        if current_size == previous_size:
+                            stable_checks += 1
+                        else:
+                            stable_checks = 0
+                            previous_size = current_size
+                        if stable_checks >= 2:
+                            media_type, _ = self._forwarded_media_profile(item)
+                            return ForwardedMediaResolution(
+                                source=path,
+                                media_type=media_type,
+                            )
                     time.sleep(0.25)
-                raise FileNotFoundError(path)
-            except Exception as exc:
-                errors.append("{}: {}".format(msgid, exc))
+                hook_failed = True
+            except Exception:
+                hook_failed = True
 
-        for url in item.get("http_urls") or []:
+        cache_checked = False
+        cache_failed = False
+        cache = self._get_forwarded_media_cache()
+        if cache is not None:
+            cache_checked = True
+            media_type, extensions = self._forwarded_media_profile(item)
             try:
-                return download_file(url, retry=2, retry_interval=0.5)
-            except Exception as exc:
-                errors.append("{}: {}".format(url[:120], exc))
+                cached = cache.find(
+                    size=expected_size,
+                    md5=self._forwarded_expected_md5(item.get("full_md5")),
+                    thumbnail_size=self._forwarded_expected_size(
+                        item.get("thumb_size")
+                    ),
+                    thumbnail_md5=self._forwarded_expected_md5(
+                        item.get("thumb_md5")
+                    ),
+                    extensions=extensions,
+                )
+            except Exception:
+                cached = None
+                cache_failed = True
+            if cached is not None:
+                return ForwardedMediaResolution(
+                    source=cached.source,
+                    filename=cached.filename,
+                    is_thumbnail=cached.is_thumbnail,
+                    note=cached.note,
+                    media_type="image" if cached.is_thumbnail else media_type,
+                    xor_encoded=cached.xor_encoded,
+                )
 
-        raise FileNotFoundError(
-            "forwarded media unavailable: {}".format(
-                "; ".join(errors) or "no msgid or downloadable URL"
+        media_type, _ = self._forwarded_media_profile(item)
+        http_failed = False
+        http_attempted = False
+        for url in item.get("http_urls") or []:
+            http_attempted = True
+            try:
+                source = self._download_forwarded_media_url(
+                    url,
+                    expected_size=expected_size,
+                    expected_md5=self._forwarded_expected_md5(
+                        item.get("full_md5")
+                    ),
+                    suffix=self._forwarded_download_suffix(item),
+                )
+                return ForwardedMediaResolution(
+                    source=source,
+                    media_type=media_type,
+                )
+            except Exception:
+                http_failed = True
+
+        if media_type in ("image", "video"):
+            thumb_size = self._forwarded_expected_size(item.get("thumb_size"))
+            thumb_md5 = self._forwarded_expected_md5(item.get("thumb_md5"))
+            for url in item.get("http_thumb_urls") or []:
+                http_attempted = True
+                try:
+                    source = self._download_forwarded_media_url(
+                        url,
+                        expected_size=thumb_size,
+                        expected_md5=thumb_md5,
+                        suffix=".jpg",
+                    )
+                    return ForwardedMediaResolution(
+                        source=source,
+                        filename="forwarded-thumbnail.jpg",
+                        is_thumbnail=True,
+                        note="仅恢复缩略图，原文件不可用",
+                        media_type="image",
+                    )
+                except Exception:
+                    http_failed = True
+
+        cache_lookup_possible = bool(
+            (expected_size is not None and self._forwarded_expected_md5(
+                item.get("full_md5")
+            ))
+            or (
+                self._forwarded_expected_size(item.get("thumb_size"))
+                is not None
+                and self._forwarded_expected_md5(item.get("thumb_md5"))
             )
         )
+        cache_incomplete = (
+            cache_checked
+            and cache_lookup_possible
+            and cache is not None
+            and not cache.complete
+        )
+        if hook_failed and cache_incomplete:
+            reason = "Hook 消息不存在或下载失败，且微信本地缓存扫描不完整"
+        elif hook_failed:
+            reason = "Hook 消息不存在或下载失败，且微信本地缓存未命中"
+        elif cache_failed:
+            reason = "微信本地缓存校验失败，且媒体地址不可用"
+        elif http_failed:
+            reason = "媒体地址不可用或内容校验失败"
+        elif cache_incomplete:
+            reason = "微信本地缓存扫描超时或超出安全上限"
+        elif item.get("cdn_data_url") or item.get("cdn_big_image_url"):
+            reason = "媒体地址不可用"
+        elif cache_checked:
+            reason = "微信本地缓存未命中"
+        elif http_attempted:
+            reason = "媒体下载失败"
+        else:
+            reason = "缺少可下载媒体信息"
+        raise ForwardedMediaUnavailable(reason)
 
     def process_friend_request(self , v3 , v4):
         self.logger.debug(f"process_friend_request:{v3} {v4}")

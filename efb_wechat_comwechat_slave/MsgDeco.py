@@ -1,5 +1,6 @@
 import logging
 import os
+import tempfile
 from typing import Any, Callable, Mapping, Optional, Tuple, List, Union, IO
 import magic
 from lxml import etree
@@ -17,9 +18,16 @@ from .CustomTypes import EFBGroupChat, EFBPrivateChat
 from .Utils import compress_image_if_large, load_local_file_to_temp
 from .chat_history import (
     ChatHistoryParseError,
+    count_history_items,
     item_meta,
     item_text,
     parse_forwarded_message,
+)
+from .forwarded_media_cache import (
+    ForwardedMediaResolution,
+    ForwardedMediaUnavailable,
+    forwarded_media_extension,
+    forwarded_media_xor_key,
 )
 
 QUOTE_DIVIDER = " - - - - - - - - - - - - - - - "
@@ -229,20 +237,96 @@ def efb_mp_post_wrapper(item: etree.Element, show_name: str = None) -> Message:
         text=f'{title}\n  - - - - - - - - - - - - - - - \n{digest}' if digest else str(title),
     )
 
-def _open_forwarded_media(resolved: Any, fallback_name: str):
-    """Normalize a resolver result to an open file and a display filename."""
+def _open_forwarded_media(
+    resolved: Any,
+    fallback_name: str,
+) -> Tuple[IO, str, Optional[ForwardedMediaResolution]]:
+    """Normalize a resolver result to an open file and display metadata."""
+    resolution = None
     filename = fallback_name
     source = resolved
-    if isinstance(resolved, tuple):
+    if isinstance(resolved, ForwardedMediaResolution):
+        resolution = resolved
+        source = resolved.source
+        if resolved.filename:
+            filename = str(resolved.filename)
+    elif isinstance(resolved, tuple):
         source = resolved[0]
         if len(resolved) > 1 and resolved[1]:
             filename = str(resolved[1])
+            resolution = ForwardedMediaResolution(
+                source=source,
+                filename=filename,
+            )
     if hasattr(source, "read") and hasattr(source, "name"):
-        return source, filename
-    path = os.fspath(source)
-    if not filename or filename == fallback_name:
-        filename = os.path.basename(path) or fallback_name
-    return load_local_file_to_temp(path), filename
+        try:
+            source.seek(0)
+        except (AttributeError, OSError):
+            pass
+        file = source
+    else:
+        path = os.fspath(source)
+        if not filename or filename == fallback_name:
+            if resolution is None or not resolution.filename:
+                filename = os.path.basename(path) or fallback_name
+        file = load_local_file_to_temp(path)
+    file, filename = _decode_forwarded_media(
+        file,
+        filename,
+        fallback_name=fallback_name,
+    )
+    return file, filename, resolution
+
+
+def _decode_forwarded_media(
+    file: IO,
+    filename: str,
+    *,
+    fallback_name: str = "",
+) -> Tuple[IO, str]:
+    """Remove WeChat's single-byte XOR wrapper when a media header is known."""
+    try:
+        file.seek(0)
+        header = file.read(32)
+        file.seek(0)
+    except (AttributeError, OSError, ValueError):
+        return file, filename
+
+    xor_key = forwarded_media_xor_key(header)
+    media_extension = forwarded_media_extension(header, xor_key)
+    if xor_key is not None:
+        output = tempfile.NamedTemporaryFile(
+            prefix="efb-forwarded-decoded-",
+            suffix=".{}".format(media_extension or "bin"),
+        )
+        translation = bytes(value ^ xor_key for value in range(256))
+        try:
+            while True:
+                chunk = file.read(1024 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk.translate(translation))
+            output.seek(0)
+        except Exception:
+            output.close()
+            raise
+        try:
+            file.close()
+        except Exception:
+            pass
+        file = output
+
+    current_extension = os.path.splitext(filename)[1].lower()
+    if media_extension and current_extension in ("", ".dat", ".bin"):
+        fallback_extension = os.path.splitext(fallback_name)[1].lower()
+        name_source = (
+            fallback_name
+            if fallback_name and fallback_extension not in ("", ".dat", ".bin")
+            else filename
+        )
+        stem = os.path.splitext(os.path.basename(name_source))[0]
+        filename = "{}.{}".format(stem or "forwarded-media", media_extension)
+    return file, filename
 
 def _forwarded_media_filename(item: dict, media_type: str) -> str:
     extension = (item.get("datafmt") or "").strip().lstrip(".").lower()
@@ -260,18 +344,26 @@ def _forwarded_media_filename(item: dict, media_type: str) -> str:
 def _build_forwarded_item_messages(
     item: dict,
     media_resolver: Optional[Callable[[dict], Any]],
+    parent_header: Optional[Message] = None,
 ) -> List[Message]:
     datatype = item.get("datatype")
     messages = []
 
     if datatype == "17":
-        messages.append(Message(
+        nested_header = Message(
             type=MsgType.Text,
             text=item_text(item),
             vendor_specific={"is_forwarded": True},
-        ))
+        )
+        if parent_header is not None:
+            nested_header.target = parent_header
+        messages.append(nested_header)
         for child in item.get("children") or []:
-            messages.extend(_build_forwarded_item_messages(child, media_resolver))
+            messages.extend(_build_forwarded_item_messages(
+                child,
+                media_resolver,
+                parent_header=nested_header,
+            ))
         return messages
 
     has_emoji = datatype == "1" and bool(item.get("emoji_urls"))
@@ -298,14 +390,26 @@ def _build_forwarded_item_messages(
     try:
         resolved = media_resolver(item)
         fallback_name = _forwarded_media_filename(item, media_type)
-        file, filename = _open_forwarded_media(resolved, fallback_name)
+        file, filename, resolution = _open_forwarded_media(
+            resolved,
+            fallback_name,
+        )
+        resolved_type = (
+            resolution.media_type
+            if resolution is not None and resolution.media_type
+            else media_type
+        )
+        if resolution is not None and resolution.is_thumbnail:
+            resolved_type = "image"
         caption = item_meta(item)
         if item.get("datatitle") and item["datatitle"] != item.get("type_name"):
             caption += "\n{}".format(item["datatitle"])
-        if is_image:
+        if resolution is not None and resolution.note:
+            caption += "\n[{}]".format(resolution.note)
+        if resolved_type == "image":
             file = compress_image_if_large(file)
             efb_msg = efb_image_wrapper(file, filename=filename, text=caption)
-        elif is_video:
+        elif resolved_type == "video":
             efb_msg = efb_video_wrapper(file, filename=filename, text=caption)
         else:
             efb_msg = efb_file_wrapper(file, filename=filename, text=caption)
@@ -313,17 +417,33 @@ def _build_forwarded_item_messages(
         vendor_specific["is_forwarded"] = True
         efb_msg.vendor_specific = vendor_specific
         return [efb_msg]
-    except Exception:
+    except ForwardedMediaUnavailable as exc:
+        reason = str(exc).strip() or "未找到可用媒体"
         logging.getLogger("comwechat").warning(
-            "合并转发媒体下载失败: datatype=%s msgids=%s",
+            "合并转发媒体不可用: display_index=%s datatype=%s reason=%s",
+            item.get("display_index"),
             datatype,
-            item.get("msgids"),
-            exc_info=True,
+            reason,
         )
         return [Message(
             type=MsgType.Text,
-            text=item_text(item) + "\n[{}下载失败，请在微信查看原文]".format(
-                item.get("type_name") or media_type
+            text=item_text(item) + "\n[{}下载失败：{}，请在微信查看原文]".format(
+                item.get("type_name") or media_type,
+                reason,
+            ),
+            vendor_specific={"is_forwarded": True},
+        )]
+    except Exception as exc:
+        logging.getLogger("comwechat").warning(
+            "合并转发媒体处理失败: display_index=%s datatype=%s exception=%s",
+            item.get("display_index"),
+            datatype,
+            type(exc).__name__,
+        )
+        return [Message(
+            type=MsgType.Text,
+            text=item_text(item) + "\n[{}下载失败：媒体读取失败，请在微信查看原文]".format(
+                item.get("type_name") or media_type,
             ),
             vendor_specific={"is_forwarded": True},
         )]
@@ -334,14 +454,25 @@ def efb_forwarded_chat_wrapper(
 ) -> List[Message]:
     parsed = parse_forwarded_message(text)
     items = parsed["items"]
-    header_lines = [parsed["title"], "共 {} 条".format(len(items))]
-    messages = [Message(
+    item_count = parsed.get("item_count")
+    if item_count is None:
+        item_count = count_history_items(items)
+    header_lines = [
+        parsed["title"],
+        "顶层 {} 条 · 含嵌套共 {} 条".format(len(items), item_count),
+    ]
+    global_header = Message(
         type=MsgType.Text,
         text="\n".join(header_lines),
         vendor_specific={"is_forwarded": True},
-    )]
+    )
+    messages = [global_header]
     for item in items:
-        messages.extend(_build_forwarded_item_messages(item, media_resolver))
+        messages.extend(_build_forwarded_item_messages(
+            item,
+            media_resolver,
+            parent_header=global_header,
+        ))
     return messages
 
 def efb_share_link_wrapper(
