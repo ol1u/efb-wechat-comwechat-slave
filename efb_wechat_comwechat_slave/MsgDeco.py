@@ -1,4 +1,6 @@
-from typing import Mapping, Tuple, List, Union, IO
+import logging
+import os
+from typing import Any, Callable, Mapping, Optional, Tuple, List, Union, IO
 import magic
 from lxml import etree
 from functools import partial
@@ -12,6 +14,13 @@ from ehforwarderbot.types import MessageID
 
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat
+from .Utils import compress_image_if_large, load_local_file_to_temp
+from .chat_history import (
+    ChatHistoryParseError,
+    item_meta,
+    item_text,
+    parse_forwarded_message,
+)
 
 QUOTE_DIVIDER = " - - - - - - - - - - - - - - - "
 
@@ -220,7 +229,126 @@ def efb_mp_post_wrapper(item: etree.Element, show_name: str = None) -> Message:
         text=f'{title}\n  - - - - - - - - - - - - - - - \n{digest}' if digest else str(title),
     )
 
-def efb_share_link_wrapper(message: dict, chat) -> Message:
+def _open_forwarded_media(resolved: Any, fallback_name: str):
+    """Normalize a resolver result to an open file and a display filename."""
+    filename = fallback_name
+    source = resolved
+    if isinstance(resolved, tuple):
+        source = resolved[0]
+        if len(resolved) > 1 and resolved[1]:
+            filename = str(resolved[1])
+    if hasattr(source, "read") and hasattr(source, "name"):
+        return source, filename
+    path = os.fspath(source)
+    if not filename or filename == fallback_name:
+        filename = os.path.basename(path) or fallback_name
+    return load_local_file_to_temp(path), filename
+
+def _forwarded_media_filename(item: dict, media_type: str) -> str:
+    extension = (item.get("datafmt") or "").strip().lstrip(".").lower()
+    if extension == "pic":
+        extension = "jpg"
+    if not extension:
+        extension = {
+            "image": "jpg",
+            "video": "mp4",
+            "file": "bin",
+        }.get(media_type, "bin")
+    stem = item.get("dataid") or "forwarded-{}".format(item.get("datatype", "item"))
+    return "{}.{}".format(stem, extension)
+
+def _build_forwarded_item_messages(
+    item: dict,
+    media_resolver: Optional[Callable[[dict], Any]],
+) -> List[Message]:
+    datatype = item.get("datatype")
+    messages = []
+
+    if datatype == "17":
+        messages.append(Message(
+            type=MsgType.Text,
+            text=item_text(item),
+            vendor_specific={"is_forwarded": True},
+        ))
+        for child in item.get("children") or []:
+            messages.extend(_build_forwarded_item_messages(child, media_resolver))
+        return messages
+
+    has_emoji = datatype == "1" and bool(item.get("emoji_urls"))
+    is_image = datatype == "2" or has_emoji
+    is_video = datatype == "4"
+    is_file = datatype == "8"
+    if not (is_image or is_video or is_file):
+        return [Message(
+            type=MsgType.Text,
+            text=item_text(item),
+            vendor_specific={"is_forwarded": True},
+        )]
+
+    media_type = "image" if is_image else "video" if is_video else "file"
+    if media_resolver is None:
+        return [Message(
+            type=MsgType.Text,
+            text=item_text(item) + "\n[{}下载失败：当前通道不支持媒体解析]".format(
+                item.get("type_name") or media_type
+            ),
+            vendor_specific={"is_forwarded": True},
+        )]
+
+    try:
+        resolved = media_resolver(item)
+        fallback_name = _forwarded_media_filename(item, media_type)
+        file, filename = _open_forwarded_media(resolved, fallback_name)
+        caption = item_meta(item)
+        if item.get("datatitle") and item["datatitle"] != item.get("type_name"):
+            caption += "\n{}".format(item["datatitle"])
+        if is_image:
+            file = compress_image_if_large(file)
+            efb_msg = efb_image_wrapper(file, filename=filename, text=caption)
+        elif is_video:
+            efb_msg = efb_video_wrapper(file, filename=filename, text=caption)
+        else:
+            efb_msg = efb_file_wrapper(file, filename=filename, text=caption)
+        vendor_specific = dict(getattr(efb_msg, "vendor_specific", None) or {})
+        vendor_specific["is_forwarded"] = True
+        efb_msg.vendor_specific = vendor_specific
+        return [efb_msg]
+    except Exception:
+        logging.getLogger("comwechat").warning(
+            "合并转发媒体下载失败: datatype=%s msgids=%s",
+            datatype,
+            item.get("msgids"),
+            exc_info=True,
+        )
+        return [Message(
+            type=MsgType.Text,
+            text=item_text(item) + "\n[{}下载失败，请在微信查看原文]".format(
+                item.get("type_name") or media_type
+            ),
+            vendor_specific={"is_forwarded": True},
+        )]
+
+def efb_forwarded_chat_wrapper(
+    text: str,
+    media_resolver: Optional[Callable[[dict], Any]] = None,
+) -> List[Message]:
+    parsed = parse_forwarded_message(text)
+    items = parsed["items"]
+    header_lines = [parsed["title"], "共 {} 条".format(len(items))]
+    messages = [Message(
+        type=MsgType.Text,
+        text="\n".join(header_lines),
+        vendor_specific={"is_forwarded": True},
+    )]
+    for item in items:
+        messages.extend(_build_forwarded_item_messages(item, media_resolver))
+    return messages
+
+def efb_share_link_wrapper(
+    message: dict,
+    chat,
+    media_resolver: Optional[Callable[[dict], Any]] = None,
+) -> Union[Message, List[Message]]:
     """
     处理msgType49消息 - 复合xml, xml 中 //appmsg/type 指示具体消息类型.
     /msg/appmsg/type
@@ -394,22 +522,21 @@ def efb_share_link_wrapper(message: dict, chat) -> Message:
             except:
                 msg_title = ""
             try:
-                recorditem_element = xml.find('.//recorditem')
-                inner_xml_string = recorditem_element.text
-                recordinfo_root = etree.fromstring(inner_xml_string.encode('utf-8'))
-                texts = []
-                for data in parse_chat_history(recordinfo_root):
-                    texts.append(data['formatted'])
-                forward_content = "\n".join(texts)
-            except Exception as e:
+                return efb_forwarded_chat_wrapper(
+                    text,
+                    media_resolver=media_resolver,
+                )
+            except ChatHistoryParseError:
+                logging.getLogger("comwechat").warning(
+                    "合并转发记录解析失败，退回微信摘要", exc_info=True
+                )
                 forward_content = xml.xpath('/msg/appmsg/des/text()')[0]
-
-            result_text += f"{msg_title}\n\n{forward_content}"
-            efb_msg = Message(
-                type=MsgType.Text,
-                text= result_text,
-                vendor_specific={ "is_forwarded": True }
-            )
+                result_text += f"{msg_title}\n\n{forward_content}"
+                efb_msg = Message(
+                    type=MsgType.Text,
+                    text= result_text,
+                    vendor_specific={ "is_forwarded": True }
+                )
         elif type == 21: # 微信运动
             msg_title = xml.xpath('/msg/appmsg/title/text()')[0].strip("<![CDATA[夺得").strip("冠军]]>")
             if '排行' not in msg_title:
