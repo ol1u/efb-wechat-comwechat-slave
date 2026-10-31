@@ -800,7 +800,8 @@ class ComWeChatChannel(SlaveChannel):
                     efb_msgs = MsgProcess(msg, chat)
                 else:
                     efb_msgs = efb_image_wrapper(
-                        load_local_file_to_temp(local_path)
+                        load_local_file_to_temp(local_path),
+                        force_animation=local_path.lower().endswith(".mp4"),
                     )
             except Exception:
                 self.logger.exception(

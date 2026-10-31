@@ -94,12 +94,18 @@ def efb_text_simple_wrapper(text: str, ats: Union[Mapping[Tuple[int, int], Union
         efb_msg.substitutions = Substitutions(ats)
     return efb_msg
 
-def efb_image_wrapper(file: IO, filename: str = None, text: str = None) -> Union[Message, List[Message]]:
+def efb_image_wrapper(
+    file: IO,
+    filename: str = None,
+    text: str = None,
+    force_animation: bool = False,
+) -> Union[Message, List[Message]]:
     """
     A EFB message wrapper for images.
     :param file: The file handle
     :param filename: The actual filename
     :param text: The attached text
+    :param force_animation: Send a video-backed sticker as an animation
     :return: EFB Message or list of EFB Messages
     """
     efb_msg = Message()
@@ -108,7 +114,7 @@ def efb_image_wrapper(file: IO, filename: str = None, text: str = None) -> Union
     if isinstance(mime, bytes):
         mime = mime.decode()
 
-    if "gif" in mime:
+    if force_animation or "gif" in mime:
         efb_msg.type = MsgType.Animation
     else:
         efb_msg.type = MsgType.Image
