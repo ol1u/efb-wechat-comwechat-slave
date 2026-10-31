@@ -1,8 +1,11 @@
 import logging
+import tempfile
 import threading
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from efb_wechat_comwechat_slave.ComWechat import ComWeChatChannel
@@ -187,6 +190,68 @@ class TestMediaRetryIntegration(unittest.TestCase):
                 ComWeChatChannel.send_efb_msgs(message, edit=True)
 
         message.file.close.assert_called_once_with()
+
+    def test_send_efb_msgs_rewinds_file_before_delivery(self):
+        message = Message()
+        message.file = tempfile.NamedTemporaryFile()
+        message.file.write(b"media payload")
+        observed = []
+        coordinator = types.SimpleNamespace(
+            master=object(),
+            send_message=lambda item: observed.append(
+                (item.file.tell(), item.file.read())
+            ),
+        )
+        executor = ThreadPoolExecutor(max_workers=1)
+        channel = types.SimpleNamespace(
+            logger=logging.getLogger("test-media-retry"),
+            _deliver_executor=executor,
+            _deliver_timeout=1,
+        )
+
+        try:
+            with patch(
+                "efb_wechat_comwechat_slave.ComWechat.coordinator",
+                coordinator,
+            ):
+                ComWeChatChannel.send_efb_msgs(channel, message)
+        finally:
+            executor.shutdown(wait=True)
+
+        self.assertEqual(observed, [(0, b"media payload")])
+        self.assertTrue(message.file.closed)
+
+    def test_redelivery_rewinds_reopened_file_before_delivery(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "video.mp4"
+            path.write_bytes(b"video payload")
+            message = Message()
+            message.file = path.open("rb")
+            message.file.seek(0, 2)
+            observed = []
+            coordinator = types.SimpleNamespace(
+                master=object(),
+                send_message=lambda item: observed.append(
+                    (item.file.tell(), item.file.read())
+                ),
+            )
+            executor = ThreadPoolExecutor(max_workers=1)
+            channel = types.SimpleNamespace(
+                _deliver_executor=executor,
+                _deliver_timeout=1,
+            )
+
+            try:
+                with patch(
+                    "efb_wechat_comwechat_slave.ComWechat.coordinator",
+                    coordinator,
+                ):
+                    ComWeChatChannel._redeliver_to_master(channel, message)
+            finally:
+                executor.shutdown(wait=True)
+                message.file.close()
+
+        self.assertEqual(observed, [(0, b"video payload")])
 
 
 if __name__ == "__main__":

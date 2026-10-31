@@ -24,11 +24,19 @@ TYPE_NAMES = {
 _WINDOWS_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _EMPTY_MSG_IDS = {"", "0", "None", "null"}
-_MEDIA_ELEMENT_NAMES = (
+_FULL_MEDIA_ELEMENT_NAMES = (
     "cdndataurl",
     "cdn_dataurl",
     "cdnbigimgurl",
+    "cdnvideourl",
+    "cdnvideo_url",
+    "cdnattachurl",
+    "cdnfileurl",
+    "cdnurl",
+)
+_THUMB_MEDIA_ELEMENT_NAMES = (
     "cdnthumburl",
+    "cdn_thumburl",
 )
 
 
@@ -150,11 +158,16 @@ def _local_paths(node: etree._Element) -> List[str]:
 
 
 def _cdn_values(node: etree._Element) -> Dict[str, Any]:
-    urls = []
-    for name in _MEDIA_ELEMENT_NAMES:
+    full_urls = []
+    for name in _FULL_MEDIA_ELEMENT_NAMES:
         value = _direct_text(node, name)
-        if value and value not in urls:
-            urls.append(value)
+        if value and value not in full_urls:
+            full_urls.append(value)
+    thumb_urls = []
+    for name in _THUMB_MEDIA_ELEMENT_NAMES:
+        value = _direct_text(node, name)
+        if value and value not in thumb_urls:
+            thumb_urls.append(value)
     emoji_urls = []
     for name in ("cdnurlstring", "cdnurl", "encrypturlstring"):
         value = _text(node, "emojiitem/{}".format(name))
@@ -162,15 +175,50 @@ def _cdn_values(node: etree._Element) -> Dict[str, Any]:
             emoji_urls.append(value.replace("&amp;", "&"))
     http_urls = [
         value
-        for value in urls + emoji_urls
+        for value in full_urls + emoji_urls
         if _HTTP_URL_RE.match(value)
     ]
+    http_thumb_urls = [
+        value for value in thumb_urls if _HTTP_URL_RE.match(value)
+    ]
     return {
-        "cdn_urls": urls,
+        "cdn_data_url": next(
+            (
+                _direct_text(node, name)
+                for name in ("cdndataurl", "cdn_dataurl")
+                if _direct_text(node, name)
+            ),
+            "",
+        ),
+        "cdn_big_image_url": _direct_text(node, "cdnbigimgurl"),
+        "cdn_thumb_url": _direct_text(node, "cdnthumburl", "cdn_thumburl"),
+        "cdn_urls": list(dict.fromkeys(full_urls + thumb_urls)),
         "emoji_urls": emoji_urls,
         "http_urls": list(dict.fromkeys(http_urls)),
+        "http_thumb_urls": list(dict.fromkeys(http_thumb_urls)),
         "cdn_data_key": _direct_text(node, "cdndatakey", "cdn_data_key"),
-        "full_md5": _direct_text(node, "fullmd5"),
+        "cdn_thumb_key": _direct_text(node, "cdnthumbkey", "cdn_thumb_key"),
+        "full_md5": _direct_text(node, "fullmd5", "filemd5", "md5"),
+        "thumb_md5": _direct_text(
+            node,
+            "thumbfullmd5",
+            "thumbmd5",
+            "thumb_md5",
+        ),
+        "datasize": _direct_text(
+            node,
+            "datasize",
+            "data_size",
+            "filesize",
+            "file_size",
+        ),
+        "thumb_size": _direct_text(
+            node,
+            "thumbsize",
+            "thumb_size",
+            "thumbdatasize",
+        ),
+        "file_key": _direct_text(node, "filekey", "file_key"),
     }
 
 
@@ -191,6 +239,7 @@ def _nested_recordinfo(node: etree._Element) -> Optional[etree._Element]:
 def parse_chat_history(
     value: Union[str, bytes, etree._Element],
     level: int = 1,
+    display_prefix: str = "",
 ) -> List[Dict[str, Any]]:
     """Parse record items while preserving order, sender, time and media IDs."""
     root = parse_recordinfo(value, level=level)
@@ -201,12 +250,21 @@ def parse_chat_history(
         return []
 
     result = []
-    for node in datalist.findall("dataitem")[:MAX_FORWARD_ITEMS]:
+    for position, node in enumerate(
+        datalist.findall("dataitem")[:MAX_FORWARD_ITEMS],
+        start=1,
+    ):
         datatype = str(node.get("datatype") or "")
+        display_index = (
+            "{}.{}".format(display_prefix, position)
+            if display_prefix
+            else str(position)
+        )
         item = {
             "datatype": datatype,
             "type_name": TYPE_NAMES.get(datatype, "未知类型"),
             "dataid": str(node.get("dataid") or ""),
+            "display_index": display_index,
             "sourcename": _direct_text(node, "sourcename", "srcname"),
             "sourcetime": _direct_text(node, "sourcetime"),
             "src_create_time": _direct_text(node, "srcMsgCreateTime"),
@@ -225,7 +283,11 @@ def parse_chat_history(
             nested = _nested_recordinfo(node)
             if nested is not None:
                 item["title"] = _direct_text(nested, "title") or item["datatitle"]
-                item["children"] = parse_chat_history(nested, level=level + 1)
+                item["children"] = parse_chat_history(
+                    nested,
+                    level=level + 1,
+                    display_prefix=display_index,
+                )
             else:
                 item["title"] = item["datatitle"]
         return_item = item
@@ -246,17 +308,21 @@ def parse_forwarded_message(
     recordinfo = parse_recordinfo(root)
     title = title or _direct_text(recordinfo, "title")
     description = description or _direct_text(recordinfo, "desc", "info")
+    items = parse_chat_history(recordinfo)
     return {
         "title": title or "转发的聊天记录",
         "description": description,
-        "items": parse_chat_history(recordinfo),
+        "items": items,
+        "item_count": count_history_items(items),
     }
 
 
 def item_meta(item: Dict[str, Any]) -> str:
     sender = item.get("sourcename") or "未知发送者"
     sent_at = item.get("sourcetime") or ""
-    return "{} · {}".format(sender, sent_at) if sent_at else sender
+    meta = "{} · {}".format(sender, sent_at) if sent_at else sender
+    display_index = str(item.get("display_index") or "").strip()
+    return "{} · {}".format(display_index, meta) if display_index else meta
 
 
 def item_text(item: Dict[str, Any]) -> str:
@@ -282,8 +348,17 @@ def item_text(item: Dict[str, Any]) -> str:
         if url:
             body += "\n{}".format(url)
     elif datatype == "17":
-        count = len(item.get("children") or [])
-        body = "{}（{} 条）".format(title or "[聊天记录]", count)
+        children = item.get("children") or []
+        direct_count = len(children)
+        total_count = count_history_items(children)
+        if total_count == direct_count:
+            count_text = "{} 条".format(direct_count)
+        else:
+            count_text = "直接 {} 条 · 含嵌套共 {} 条".format(
+                direct_count,
+                total_count,
+            )
+        body = "{}（{}）".format(title or "[聊天记录]", count_text)
     elif datatype in ("2", "3", "4", "8"):
         body = title or "[{}]".format(type_name)
     else:
@@ -297,3 +372,12 @@ def iter_history_items(items: List[Dict[str, Any]]):
         for child in item.get("children") or []:
             for nested in iter_history_items([child]):
                 yield nested
+
+
+def count_history_items(items: List[Dict[str, Any]]) -> int:
+    """Count direct and recursively nested record items."""
+    total = 0
+    for item in items:
+        total += 1
+        total += count_history_items(item.get("children") or [])
+    return total
