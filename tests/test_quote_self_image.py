@@ -1,7 +1,8 @@
 import ast
+import threading
 import unittest
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 
 SOURCE = Path(__file__).parents[1] / "efb_wechat_comwechat_slave" / "ComWechat.py"
@@ -35,9 +36,12 @@ def load_send_text():
     namespace = {
         "ChatID": str,
         "Message": Message,
+        "MessageID": str,
         "MsgType": MsgType,
+        "Optional": Optional,
         "SelfChatMember": SelfChatMember,
         "SlaveChannel": SlaveChannel,
+        "threading": threading,
         "is_message_reference": lambda value: str(value).isdigit() or str(value).startswith("local:"),
         "load_message_ids": lambda message_id: str(message_id).split(","),
         "qutoed_text": lambda quoted, text: f"「{quoted}」\\n - - - - - - - - - - - - - - - \\n{text}",
@@ -54,6 +58,7 @@ def load_send_message_reference():
     function = next(node for node in channel.body if isinstance(node, ast.FunctionDef) and node.name == "_send_message_reference")
     function.decorator_list = []
     namespace = {
+        "Any": Any,
         "Dict": Dict,
         "Optional": Optional,
         "MessageID": str,
@@ -94,12 +99,31 @@ class Channel:
         self.me = {"wxNickName": "自己"}
         self.group_members = {}
         self.bot = RecordingBot()
+        self.sent_msgs = {}
+        self.sent_msg_results = {}
+        self.pending_lock = threading.Lock()
+        self.send_timeout = 1
 
     @staticmethod
     def _send_message_reference(response):
         if response.get("result") != "OK":
             return None
-        return str(response.get("svrid") or response.get("localref"))
+        return str(response.get("localref") or "")
+
+    def _resolve_send_reference(self, response, key, timeout):
+        reference = self._send_message_reference(response)
+        with self.pending_lock:
+            self.sent_msgs.pop(key, None)
+            self.sent_msg_results.pop(key, None)
+        return reference or None
+
+    def _send_and_resolve_reference(self, wxid, send_call, key, **kwargs):
+        response = send_call()
+        reference = self._send_message_reference(response)
+        with self.pending_lock:
+            self.sent_msgs.pop(key, None)
+            self.sent_msg_results.pop(key, None)
+        return response, reference or None
 
 
 class SelfImageQuoteTest(unittest.TestCase):
@@ -109,9 +133,9 @@ class SelfImageQuoteTest(unittest.TestCase):
         self.assertIsNone(send_reference({"msg": 1, "result": "OK", "svrid": "1234567"}))
         self.assertEqual(send_reference({"msg": 1, "result": "OK", "localref": "local:7:123"}), "local:7:123")
         self.assertIsNone(send_reference({"msg": 0, "result": "ERROR"}))
-        self.assertNotIn("sent_msgs", SOURCE.read_text(encoding="utf-8"))
+        self.assertIn("_resolve_send_reference", SOURCE.read_text(encoding="utf-8"))
 
-    def test_reply_to_self_image_uses_native_quote_api(self):
+    def test_reply_to_self_image_uses_text_quote(self):
         target = Message()
         target.author = SelfChatMember()
         target.deliver_to = SlaveChannel()
@@ -126,8 +150,11 @@ class SelfImageQuoteTest(unittest.TestCase):
         channel = Channel()
         localref = load_send_text()(channel, "friend", message)
 
-        self.assertEqual(channel.bot.texts, [])
-        self.assertEqual(channel.bot.quotes, [("friend", "这是300w的三者", "123456")])
+        self.assertEqual(
+            channel.bot.texts,
+            [("friend", "「Image」\\n - - - - - - - - - - - - - - - \\n这是300w的三者")],
+        )
+        self.assertEqual(channel.bot.quotes, [])
         self.assertEqual(localref, "local:1:1234567")
 
     def test_reply_without_server_message_id_uses_text_fallback(self):
