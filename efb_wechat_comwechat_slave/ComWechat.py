@@ -34,9 +34,14 @@ from ehforwarderbot.status import MessageRemoval, ChatUpdates
 
 from .ChatMgr import ChatMgr
 from .CustomTypes import EFBGroupChat, EFBPrivateChat, EFBGroupMember, EFBSystemUser
-from .MsgDeco import qutoed_text, efb_image_wrapper, efb_text_simple_wrapper
+from .MsgDeco import (
+    efb_image_wrapper,
+    efb_text_simple_wrapper,
+    is_supported_share_thumbnail,
+    qutoed_text,
+)
 from .MsgProcess import MsgProcess, MsgWrapper
-from .Utils import download_file , load_config , load_temp_file_to_local , load_local_file_to_temp , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference
+from .Utils import download_file , load_config , load_temp_file_to_local , load_local_file_to_temp , WC_EMOTICON_CONVERSION , is_emoticon_share , emoticon_cdn_url , emoticon_full_urls , dump_message_ids , load_message_ids , is_message_reference , wechatimagedecode
 from .db import DatabaseManager
 from .delivery_retry import DeliveryRetryQueue
 from .Constant import QUOTE_MESSAGE
@@ -61,6 +66,9 @@ from PIL import Image
 
 # 语音数据库分片名(兜底用,实际以 hook 上报的句柄列表为准;移植自上游 b278d27)
 VOICE_DATABASE_NAMES = ("MediaMSG0.db", "MediaMSG1.db", "MediaMSG2.db")
+SHARE_THUMBNAIL_MAX_BYTES = 10 * 1024 * 1024
+SHARE_THUMBNAIL_MAX_REMOTE_ATTEMPTS = 3
+SHARE_THUMBNAIL_TIMEOUT = 5
 
 FORWARDED_MEDIA_CACHE_RELATIVE_ROOTS = (
     os.path.join("FileStorage", "MsgAttach"),
@@ -929,6 +937,7 @@ class ComWeChatChannel(SlaveChannel):
                 msg,
                 chat,
                 forwarded_media_resolver=self._resolve_forwarded_media,
+                share_thumbnail_resolver=self._resolve_share_thumbnail,
             )
         except Exception:
             # 单条消息处理失败时降级为文本提示,避免异常上浮拖死接收线程导致后续消息丢失
@@ -939,6 +948,7 @@ class ComWeChatChannel(SlaveChannel):
                 msg,
                 chat,
                 forwarded_media_resolver=self._resolve_forwarded_media,
+                share_thumbnail_resolver=self._resolve_share_thumbnail,
             )
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
@@ -1170,6 +1180,7 @@ class ComWeChatChannel(SlaveChannel):
                         msg,
                         chat,
                         forwarded_media_resolver=self._resolve_forwarded_media,
+                        share_thumbnail_resolver=self._resolve_share_thumbnail,
                     ),
                 ),
                 author=author,
@@ -1226,6 +1237,7 @@ class ComWeChatChannel(SlaveChannel):
                 msg,
                 chat,
                 forwarded_media_resolver=self._resolve_forwarded_media,
+                share_thumbnail_resolver=self._resolve_share_thumbnail,
             )
         except Exception:
             self.logger.exception("处理文件消息失败,降级为文本提示: %s", path)
@@ -1235,6 +1247,7 @@ class ComWeChatChannel(SlaveChannel):
                 msg,
                 chat,
                 forwarded_media_resolver=self._resolve_forwarded_media,
+                share_thumbnail_resolver=self._resolve_share_thumbnail,
             )
         self.send_efb_msgs(MsgWrapper(msg, efb_msgs), author=author, chat=chat, uid=MessageID(str(msg['msgid'])))
 
@@ -1275,6 +1288,71 @@ class ComWeChatChannel(SlaveChannel):
                 relative = normalized_path[len(normalized_base):].lstrip("\\")
                 return os.path.join(local_dir, relative.replace("\\", os.sep))
         return windows_to_wsl_path(path, bool(getattr(self, "is_wsl", False)))
+
+    def _resolve_share_thumbnail(self, msg: Dict[str, Any], card: Any):
+        """Best-effort local or HTTP thumbnail for a normalized share card."""
+        local_candidates = []
+        remote_candidates = []
+        for field in ("thumb_path", "thumbpath", "thumb_url", "thumburl"):
+            raw_path = msg.get(field)
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                continue
+            if raw_path.lower().startswith(("http://", "https://")):
+                if raw_path not in remote_candidates:
+                    remote_candidates.append(raw_path)
+                continue
+            local_candidates.append(self._hook_path_to_local(raw_path))
+
+        for local_path in local_candidates:
+            if not os.path.isfile(local_path):
+                continue
+            try:
+                if os.path.getsize(local_path) > SHARE_THUMBNAIL_MAX_BYTES:
+                    self.logger.debug("分享消息本地缩略图超过大小限制: %s", local_path)
+                    continue
+            except OSError:
+                continue
+            thumbnail = None
+            try:
+                thumbnail = wechatimagedecode(local_path)
+            except Exception:
+                try:
+                    thumbnail = load_local_file_to_temp(local_path)
+                except Exception:
+                    continue
+            try:
+                if os.path.getsize(thumbnail.name) > SHARE_THUMBNAIL_MAX_BYTES:
+                    raise ValueError("thumbnail exceeds 10 MiB")
+                if is_supported_share_thumbnail(thumbnail):
+                    thumbnail.seek(0)
+                    return thumbnail
+            except Exception:
+                pass
+            thumbnail.close()
+
+        urls = list(dict.fromkeys(
+            remote_candidates + list(getattr(card, "thumbnail_urls", ()))
+        ))[:SHARE_THUMBNAIL_MAX_REMOTE_ATTEMPTS]
+        for url in urls:
+            thumbnail = None
+            try:
+                thumbnail = download_file(
+                    url,
+                    retry=1,
+                    retry_interval=0,
+                    timeout=SHARE_THUMBNAIL_TIMEOUT,
+                    max_bytes=SHARE_THUMBNAIL_MAX_BYTES,
+                )
+                if os.path.getsize(thumbnail.name) > SHARE_THUMBNAIL_MAX_BYTES:
+                    raise ValueError("thumbnail exceeds 10 MiB")
+                if is_supported_share_thumbnail(thumbnail):
+                    thumbnail.seek(0)
+                    return thumbnail
+            except Exception as exc:
+                self.logger.debug("分享消息缩略图下载失败: %s", exc)
+            if thumbnail is not None:
+                thumbnail.close()
+        return None
 
     def GetMsgCdn(self, msgid) -> str:
         """Download one image, video or file through hook API type 47."""
