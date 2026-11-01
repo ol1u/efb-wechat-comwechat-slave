@@ -30,6 +30,7 @@ def MsgProcess(
     direct_transfer: bool = False,
     animated_sticker_resolver: Optional[Callable[[dict], Any]] = None,
     forwarded_media_resolver: Optional[Callable[[dict], Any]] = None,
+    share_thumbnail_resolver: Optional[Callable[[dict, Any], Any]] = None,
 ) -> Union[Message, List[Message]]:
 
     if msg["type"] == "text":
@@ -95,6 +96,7 @@ def MsgProcess(
             msg,
             chat,
             media_resolver=forwarded_media_resolver,
+            thumbnail_resolver=share_thumbnail_resolver,
         )  # may return msgs in a list
 
     elif msg["type"] == "voice":

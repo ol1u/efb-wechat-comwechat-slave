@@ -7,7 +7,7 @@ import requests as requests
 import re
 import json
 import yaml
-from typing import Dict , Any
+from typing import Dict , Any, Optional
 from ehforwarderbot.types import MessageID
 import pilk
 import pydub
@@ -71,7 +71,13 @@ def emoticon_full_urls(msg : dict) -> list:
         uniq.sort(key=lambda u: (f"m={md5}&" not in u, u))
     return uniq
 
-def download_file(url: str, retry: int = 5, retry_interval: float = 5.0) -> tempfile:
+def download_file(
+    url: str,
+    retry: int = 5,
+    retry_interval: float = 5.0,
+    timeout: float = 10,
+    max_bytes: Optional[int] = None,
+) -> tempfile:
     """
     从 URL 下载文件。相比原版更健壮:
     - 检查 HTTP 状态码,404/403 等也抛异常走重试。
@@ -83,19 +89,38 @@ def download_file(url: str, retry: int = 5, retry_interval: float = 5.0) -> temp
     :param retry: 放弃前的最大尝试次数
     :param retry_interval: 每次重试前的等待秒数
     :param url: The URL that points to the file
+    :param timeout: 单次连接/读取超时
+    :param max_bytes: 可选下载上限,超过后立即中止
     """
     count = 1
     while True:
+        file = None
         try:
             file = tempfile.NamedTemporaryFile()
-            r = requests.get(url, stream=True, timeout=10)
-            r.raise_for_status()
-            for chunk in r.iter_content(chunk_size=1024):
-                if chunk:
+            with requests.get(url, stream=True, timeout=timeout) as response:
+                response.raise_for_status()
+                content_length = response.headers.get("Content-Length")
+                if (
+                    max_bytes is not None
+                    and content_length
+                    and int(content_length) > max_bytes
+                ):
+                    raise ValueError(
+                        f"download exceeds {max_bytes} bytes: {content_length}"
+                    )
+                written = 0
+                for chunk in response.iter_content(chunk_size=1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if max_bytes is not None and written > max_bytes:
+                        raise ValueError(f"download exceeds {max_bytes} bytes")
                     file.write(chunk)
                     file.flush()
             file.seek(0)
         except Exception as e:
+            if file is not None:
+                file.close()
             logging.getLogger(__name__).warning(f"Error occurred when downloading {url} (attempt {count}/{retry}). {e}")
             if count >= retry:
                 logging.getLogger(__name__).warning(f"Maximum retry reached. Giving up.")
