@@ -115,11 +115,16 @@ for _sub, _attrs in [
     ("ChatMgr", {"ChatMgr": object}),
     ("CustomTypes", {"EFBGroupChat": object, "EFBPrivateChat": object,
                      "EFBGroupMember": object, "EFBSystemUser": object}),
-    ("MsgDeco", {"qutoed_text": lambda *a, **k: ""}),
+    ("MsgDeco", {
+        "qutoed_text": lambda *a, **k: "",
+        "efb_image_wrapper": lambda *a, **k: None,
+        "efb_text_simple_wrapper": lambda *a, **k: None,
+    }),
     ("MsgProcess", {"MsgProcess": object, "MsgWrapper": object}),
     ("Utils", {"download_file": lambda *a, **k: None,
                "load_config": lambda *a, **k: {},
                "load_temp_file_to_local": _write_dummy,
+               "load_local_file_to_temp": lambda *a, **k: None,
                "WC_EMOTICON_CONVERSION": {},
                "is_emoticon_share": lambda *a, **k: False,
                "emoticon_cdn_url": lambda *a, **k: "",
@@ -130,6 +135,19 @@ for _sub, _attrs in [
     ("db", {"DatabaseManager": object}),
     ("delivery_retry", {"DeliveryRetryQueue": object}),
     ("Constant", {"QUOTE_MESSAGE": "quote:%s"}),
+    ("forwarded_media_cache", {
+        "ForwardedMediaCache": object,
+        "ForwardedMediaResolution": object,
+        "ForwardedMediaUnavailable": _EFBError,
+    }),
+    ("openim_media", {
+        "download_openim_media": lambda *a, **k: None,
+        "is_openim_chat_id": lambda value: False,
+        "is_openim_media_message": lambda *a, **k: False,
+        "openim_local_cursor": lambda *a, **k: 0,
+        "wait_for_openim_sent_reference": lambda *a, **k: None,
+        "windows_to_wsl_path": lambda path: path,
+    }),
 ]:
     _stub(f"efb_wechat_comwechat_slave.{_sub}", **_attrs)
 
@@ -158,6 +176,7 @@ def _channel(bot, tmpdir, send_timeout=0.2):
     ch.sent_msgs = {}
     ch.sent_msg_results = {}
     ch.pending_lock = threading.Lock()
+    ch._openim_send_lock = threading.Lock()
     ch._file_op_seq = 0
     ch.cache = set()
     ch.logger = logging.getLogger("test-fileop")

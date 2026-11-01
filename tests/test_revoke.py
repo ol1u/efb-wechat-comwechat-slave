@@ -1,7 +1,9 @@
 import hashlib
 import logging
+import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 
 from cachetools import TTLCache
 from ehforwarderbot import MsgType
@@ -36,6 +38,59 @@ class SendingBot(RecordingBot):
         return {"msg": 1, "result": "OK", "localref": "local:1:123"}
 
 
+class OpenIMDBBot(RecordingBot):
+    def __init__(self):
+        super().__init__()
+        self.next_local_id = 7934
+        self.sent_rows = []
+        self.queries = []
+
+    def GetDBHandle(self, name):
+        self.handle_name = name
+        return 42
+
+    def QueryDatabase(self, **kwargs):
+        self.queries.append(kwargs)
+        sql = kwargs["sql"]
+        if "max_local_id" in sql:
+            return {
+                "result": "OK",
+                "data": [["max_local_id"], [str(self.next_local_id)]],
+            }
+        if "localId>" in sql:
+            return {
+                "result": "OK",
+                "data": [
+                    ["localId", "MsgSvrID", "type", "strContent", "IsSender"],
+                    *self.sent_rows,
+                ],
+            }
+        raise AssertionError("unexpected SQL: {}".format(sql))
+
+    def SendText(self, *, wxid, msg):
+        self.next_local_id += 1
+        self.sent_rows.append([
+            str(self.next_local_id),
+            "7913379307657962822",
+            "1",
+            msg,
+            "1",
+        ])
+        return {"msg": 1, "result": "OK"}
+
+
+class CallbackOnlyBot(RecordingBot):
+    def __init__(self, channel):
+        super().__init__()
+        self.channel = channel
+
+    def SendText(self, *, wxid, msg):
+        for event_key, event in list(self.channel.sent_msgs.items()):
+            self.channel.sent_msg_results[event_key] = "888"
+            event.set()
+        return {"msg": 1, "result": "OK"}
+
+
 class EditingBot(RecordingBot):
     def __init__(self, response=None):
         super().__init__(response)
@@ -55,6 +110,22 @@ class EditingBot(RecordingBot):
             "localref": f"local:1:{self.next_id}",
         }
 
+    def SendImage(self, *, receiver, img_path):
+        self.events.append(("image", {
+            "receiver": receiver,
+            "img_path": img_path,
+        }))
+        self.next_id += 1
+        return {
+            "msg": 1,
+            "result": "OK",
+            "localref": f"local:1:{self.next_id}",
+        }
+
+    def ForwardMessage(self, *, wxid, msgid):
+        self.events.append(("forward", {"wxid": wxid, "msgid": msgid}))
+        return {"msg": 1, "result": "OK"}
+
 
 class RevokeTest(unittest.TestCase):
     def make_channel(self, response=None):
@@ -65,6 +136,8 @@ class RevokeTest(unittest.TestCase):
         channel.sent_msg_results = {}
         channel.cache = TTLCache(maxsize=200, ttl=300)
         channel.file_lock_key = "__file_op__"
+        channel._file_op_seq = 0
+        channel._openim_send_lock = threading.Lock()
         channel.revoke_message_ids = TTLCache(maxsize=200, ttl=300)
         channel.bot = RecordingBot(response)
         return channel
@@ -88,12 +161,73 @@ class RevokeTest(unittest.TestCase):
         channel.send_message(message)
 
         self.assertEqual(message.uid, "local:1:123")
+        self.assertEqual(channel.sent_msgs, {})
+        self.assertEqual(channel.sent_msg_results, {})
+
+    def test_openim_send_uses_chatcrmsg_without_sent_msg(self):
+        channel = self.make_channel()
+        channel.bot = OpenIMDBBot()
+        channel.wxid = "wxid-self"
+        channel.mark_as_read_enabled = False
+        channel.send_timeout = 1
+        message = Message(
+            chat=PrivateChat(channel=channel, uid="123@openim", name="wecom"),
+            text="hello wecom",
+            type=MsgType.Text,
+        )
+
+        channel.send_message(message)
+
+        self.assertEqual(message.uid, "7913379307657962822")
+        self.assertEqual(channel.sent_msgs, {})
+        self.assertEqual(channel.sent_msg_results, {})
+        self.assertEqual(channel.bot.handle_name, "OpenIMMsg.db")
+        self.assertEqual(len(channel.bot.queries), 2)
+
+    def test_public_account_keeps_sent_msg_behavior(self):
+        channel = self.make_channel()
+        channel.bot = CallbackOnlyBot(channel)
+        channel.wxid = "wxid-self"
+        channel.mark_as_read_enabled = False
+        channel.send_timeout = 1
+        message = Message(
+            chat=PrivateChat(
+                channel=channel,
+                uid="gh_e2bd4f6f54d2",
+                name="public account",
+            ),
+            text="hello public account",
+            type=MsgType.Text,
+        )
+
+        channel.send_message(message)
+
+        self.assertEqual(message.uid, "888")
+
+    def test_send_message_falls_back_to_sent_msg_without_localref(self):
+        channel = self.make_channel()
+        channel.bot = CallbackOnlyBot(channel)
+        channel.wxid = "wxid-self"
+        channel.mark_as_read_enabled = False
+        channel.send_timeout = 1
+        message = Message(
+            chat=PrivateChat(channel=channel, uid="wxid-chat", name="chat"),
+            text="hello private",
+            type=MsgType.Text,
+        )
+
+        channel.send_message(message)
+
+        self.assertEqual(message.uid, "888")
+        self.assertEqual(channel.sent_msgs, {})
+        self.assertEqual(channel.sent_msg_results, {})
 
     def make_edit_channel(self, response=None):
         channel = self.make_channel(response)
         channel.bot = EditingBot(response)
         channel.wxid = "wxid-self"
         channel.mark_as_read_enabled = False
+        channel.send_timeout = 1
         return channel
 
     def make_edit_message(self, channel, uid, text="", message_type=MsgType.Text, edit_media=False):
@@ -153,26 +287,33 @@ class RevokeTest(unittest.TestCase):
 
     def test_editing_media_with_edit_media_resends_media(self):
         channel = self.make_edit_channel()
+        channel.dir = "/tmp/"
+        channel.base_path = "/tmp"
+        channel.is_wsl = False
+        channel.delete_file = {}
 
-        def send_image(wxid, message):
-            channel.bot.events.append(("image", {"wxid": wxid}))
-            return "local:1:902"
+        with tempfile.NamedTemporaryFile(suffix=".jpg") as upload:
+            message = self.make_edit_message(
+                channel,
+                "local:1:10",
+                message_type=MsgType.Image,
+                edit_media=True,
+            )
+            message.file = upload
 
-        channel.send_image = send_image
-        message = self.make_edit_message(
-            channel,
-            "local:1:10",
-            message_type=MsgType.Image,
-            edit_media=True,
-        )
-
-        channel.send_message(message)
+            with patch(
+                "efb_wechat_comwechat_slave.ComWechat.load_temp_file_to_local"
+            ):
+                channel.send_message(message)
 
         self.assertEqual(channel.bot.events, [
             ("revoke", {"wxid": "wxid-chat", "msgid": "local:1:10"}),
-            ("image", {"wxid": "wxid-chat"}),
+            ("image", {
+                "receiver": "wxid-chat",
+                "img_path": f"/tmp/wxid-self/{upload.name.rsplit('/', 1)[-1]}",
+            }),
         ])
-        self.assertEqual(message.uid, "local:1:902")
+        self.assertEqual(message.uid, "local:1:901")
 
     def test_edit_rejects_commands_before_retracting(self):
         channel = self.make_edit_channel()
@@ -209,7 +350,7 @@ class RevokeTest(unittest.TestCase):
             ("revoke", {"wxid": "wxid-chat", "msgid": "123"}),
         ])
 
-    def test_editing_forward_marker_sends_text_instead_of_forwarding(self):
+    def test_editing_forward_marker_revokes_then_forwards(self):
         channel = self.make_edit_channel()
         marker = hashlib.md5(channel.channel_id.encode("utf-8")).hexdigest()
         message = self.make_edit_message(
@@ -220,10 +361,10 @@ class RevokeTest(unittest.TestCase):
 
         channel.send_message(message)
 
-        self.assertEqual(channel.bot.events[-1], (
-            "text",
-            {"wxid": "wxid-chat", "msg": f"ehforwarderbot://{marker}/forward/456"},
-        ))
+        self.assertEqual(channel.bot.events, [
+            ("revoke", {"wxid": "wxid-chat", "msgid": "123"}),
+            ("forward", {"wxid": "wxid-chat", "msgid": "456"}),
+        ])
 
     def test_comma_delimited_uid_recalls_every_server_id(self):
         channel = self.make_channel()
