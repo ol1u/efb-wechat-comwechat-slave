@@ -47,7 +47,10 @@ from .forwarded_media_cache import (
 )
 from .openim_media import (
     download_openim_media,
+    is_openim_chat_id,
     is_openim_media_message,
+    openim_local_cursor,
+    wait_for_openim_sent_reference,
     windows_to_wsl_path,
 )
 
@@ -193,6 +196,7 @@ class ComWeChatChannel(SlaveChannel):
         self.sent_msgs: Dict[Any, threading.Event] = {}  # {(wxid, text): Event} 等待 hook 回传 msgid
         self.sent_msg_results: Dict[Any, MessageID] = {}
         self.pending_lock = threading.Lock()
+        self._openim_send_lock = threading.Lock()
         self._file_op_seq = 0  # 文件发送唯一序号,供 _register_file_wait 生成不重复 key
         self.revoke_message_ids = TTLCache(maxsize=200, ttl=max(self.time_out, 1))  # 防撤回回声
         self.send_timeout = self.config.get("send_timeout", 5)  # 等待 hook 回传 msgid 的超时(秒)
@@ -1006,10 +1010,15 @@ class ComWeChatChannel(SlaveChannel):
             self.sent_msgs[key] = threading.Event()
         return key
 
+    def _discard_wait(self, key: Any) -> None:
+        """清理一条未完成的 sent_msg 等待及其结果。"""
+        with self.pending_lock:
+            self.sent_msgs.pop(key, None)
+            self.sent_msg_results.pop(key, None)
+
     def _discard_file_wait(self, file_key: Any) -> None:
         """发送接口抛异常时丢弃已注册的等待,避免 stale key 占用 FIFO 首位。"""
-        with self.pending_lock:
-            self.sent_msgs.pop(file_key, None)
+        self._discard_wait(file_key)
 
     def _find_pending_file_key(self, sender: str) -> Optional[Any]:
         """找到该发送者最早挂起的文件操作 key(调用时须已持有 pending_lock)。
@@ -1046,6 +1055,101 @@ class ComWeChatChannel(SlaveChannel):
             )
             return None
         return received_msgid
+
+    @staticmethod
+    def _send_message_reference(response: Any) -> Optional[MessageID]:
+        """Extract a synchronous local reference from a send response."""
+        if not isinstance(response, dict) or response.get("result") != "OK":
+            return None
+        reference = MessageID(str(response.get("localref") or ""))
+        return reference if is_message_reference(reference) else None
+
+    def _resolve_send_reference(
+        self,
+        response: Any,
+        key: Any,
+    ) -> Optional[MessageID]:
+        """Use a synchronous local reference, otherwise wait for sent_msg."""
+        reference = self._send_message_reference(response)
+        if reference is not None:
+            self._discard_wait(key)
+            return reference
+        return self._wait(key, self.send_timeout)
+
+    def _send_and_resolve_reference(
+        self,
+        wxid: ChatID,
+        send_call,
+        key: Any,
+        *,
+        expected_type: Optional[int] = None,
+        expected_content: Optional[str] = None,
+    ) -> Tuple[Any, Optional[MessageID]]:
+        """发送消息并取得可撤回引用。
+
+        私人微信和公众号继续等待 sent_msg。企业微信不推送 sent_msg,发送前后
+        只轮询 OpenIMMsg.db.ChatCRMsg,避免改动其他会话链路。
+        """
+        chat_id = str(wxid)
+        if not is_openim_chat_id(chat_id):
+            try:
+                response = send_call()
+            except Exception:
+                self._discard_wait(key)
+                raise
+            # 公众号保持原链路：不使用新增 localref 逻辑。
+            if chat_id.startswith("gh_"):
+                return response, self._wait(key, self.send_timeout)
+            return response, self._resolve_send_reference(response, key)
+
+        with self._openim_send_lock:
+            try:
+                cursor = openim_local_cursor(self.bot, chat_id)
+            except Exception:
+                self.logger.warning(
+                    "获取企业微信消息游标失败,本条消息将缺少撤回 ID",
+                    exc_info=True,
+                )
+                cursor = None
+
+            try:
+                response = send_call()
+            except Exception:
+                self._discard_wait(key)
+                raise
+            self._discard_wait(key)
+
+            if cursor is None:
+                return response, None
+            try:
+                reference = wait_for_openim_sent_reference(
+                    self.bot,
+                    chat_id,
+                    cursor,
+                    timeout=self.send_timeout,
+                    expected_type=expected_type,
+                    expected_content=expected_content,
+                )
+            except Exception:
+                self.logger.warning(
+                    "查询企业微信已发送消息失败,本条消息将缺少撤回 ID",
+                    exc_info=True,
+                )
+                return response, None
+
+        if reference is None:
+            self.logger.warning(
+                "[msgid-missing] ChatCRMsg 未找到本次企业微信发送记录(wxid=%s)",
+                wxid,
+            )
+            return response, None
+        self.logger.debug(
+            "企业微信消息引用: wxid=%s cursor=%s msgid=%s",
+            wxid,
+            cursor,
+            reference,
+        )
+        return response, MessageID(str(reference))
 
     def _deliver_pending_file(self, path: str):
         """处理一条延迟等待的文件消息,成功或降级后从队列移除。"""
@@ -1818,12 +1922,14 @@ class ComWeChatChannel(SlaveChannel):
             
             self.logger.debug(f"发送图片路径: {img_path}")
             file_key = self._register_file_wait(chat_uid)
-            try:
-                res = self.bot.SendImage(receiver = chat_uid , img_path = img_path)
-            except Exception:
-                self._discard_file_wait(file_key)
-                raise
-            media_msgid = self._wait(file_key, self.send_timeout)
+            res, media_msgid = self._send_and_resolve_reference(
+                chat_uid,
+                lambda: self.bot.SendImage(
+                    receiver = chat_uid,
+                    img_path = img_path,
+                ),
+                file_key,
+            )
             if media_msgid:
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
@@ -1857,12 +1963,14 @@ class ComWeChatChannel(SlaveChannel):
             
             self.logger.debug(f"发送文件路径: {file_path}")
             file_key = self._register_file_wait(chat_uid)
-            try:
-                res = self.bot.SendFile(receiver = chat_uid , file_path = file_path)
-            except Exception:
-                self._discard_file_wait(file_key)
-                raise
-            media_msgid = self._wait(file_key, self.send_timeout)
+            res, media_msgid = self._send_and_resolve_reference(
+                chat_uid,
+                lambda: self.bot.SendFile(
+                    receiver = chat_uid,
+                    file_path = file_path,
+                ),
+                file_key,
+            )
             if media_msgid:
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
@@ -1888,12 +1996,14 @@ class ComWeChatChannel(SlaveChannel):
             
             self.logger.debug(f"发送动画表情路径: {file_path}")
             file_key = self._register_file_wait(chat_uid)
-            try:
-                res = self.bot.SendEmotion(wxid = chat_uid , img_path = file_path)
-            except Exception:
-                self._discard_file_wait(file_key)
-                raise
-            media_msgid = self._wait(file_key, self.send_timeout)
+            res, media_msgid = self._send_and_resolve_reference(
+                chat_uid,
+                lambda: self.bot.SendEmotion(
+                    wxid = chat_uid,
+                    img_path = file_path,
+                ),
+                file_key,
+            )
             if media_msgid:
                 msg_ids.append(media_msgid)
             self.delete_file[local_path] = int(time.time())
@@ -1974,15 +2084,28 @@ class ComWeChatChannel(SlaveChannel):
                         key = (wxid, xml)
                         with self.pending_lock:
                             self.sent_msgs[key] = threading.Event()
-                        self.bot.SendXml(wxid = wxid , xml = xml, img_path = "")
-                        return self._wait(key, self.send_timeout)
+                        return self._send_and_resolve_reference(
+                            wxid,
+                            lambda: self.bot.SendXml(
+                                wxid = wxid,
+                                xml = xml,
+                                img_path = "",
+                            ),
+                            key,
+                            expected_type=49,
+                        )[1]
         key = (wxid, text)
         with self.pending_lock:
             self.sent_msgs[key] = threading.Event()
-        self.bot.SendText(wxid = wxid , msg = text)
         # API 没抛异常即发送成功（hook 的 {msg} 返回值不可靠，不做判断）；
-        # msgid 拿不到只记 [msgid-missing] 告警（_wait 内已有），不判失败
-        return self._wait(key, self.send_timeout)
+        # 私人微信/公众号等待 sent_msg；企业微信改为轮询 ChatCRMsg。
+        return self._send_and_resolve_reference(
+            wxid,
+            lambda: self.bot.SendText(wxid = wxid, msg = text),
+            key,
+            expected_type=1,
+            expected_content=text,
+        )[1]
 
     def get_chat_picture(self, chat: 'Chat') -> BinaryIO:
         wxid = chat.uid
@@ -2031,7 +2154,7 @@ class ComWeChatChannel(SlaveChannel):
 
         failures = []
         for server_msgid in references:
-            if not server_msgid.isdecimal():
+            if not is_message_reference(server_msgid):
                 raise EFBMessageError(f"无效的消息 ID: {server_msgid}")
 
             self.revoke_message_ids[server_msgid] = True

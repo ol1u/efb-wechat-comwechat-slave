@@ -16,8 +16,12 @@ SPEC.loader.exec_module(openim_media)
 
 OpenIMMediaError = openim_media.OpenIMMediaError
 download_openim_media = openim_media.download_openim_media
+find_openim_sent_reference = openim_media.find_openim_sent_reference
+is_openim_chat_id = openim_media.is_openim_chat_id
 is_openim_media_message = openim_media.is_openim_media_message
 is_openim_message = openim_media.is_openim_message
+openim_local_cursor = openim_media.openim_local_cursor
+wait_for_openim_sent_reference = openim_media.wait_for_openim_sent_reference
 windows_to_wsl_path = openim_media.windows_to_wsl_path
 
 
@@ -53,6 +57,89 @@ class OpenIMMessageDetectionTest(unittest.TestCase):
             "sender": "wxid_friend",
             "message": "联系 someone@openim 获取文件",
         }))
+
+    def test_detects_openim_chatroom_id(self):
+        self.assertTrue(is_openim_chat_id("123456@im.chatroom"))
+        self.assertFalse(is_openim_chat_id("gh_e2bd4f6f54d2"))
+
+
+class OpenIMSentReferenceTest(unittest.TestCase):
+    class QueryBot:
+        def __init__(self, *responses):
+            self.responses = list(responses)
+            self.queries = []
+
+        def GetDBHandle(self, name):
+            self.handle_name = name
+            return 42
+
+        def QueryDatabase(self, **kwargs):
+            self.queries.append(kwargs)
+            return self.responses.pop(0)
+
+    def test_cursor_uses_chatcrmsg_for_the_exact_talker(self):
+        bot = self.QueryBot({
+            "result": "OK",
+            "data": [["max_local_id"], ["7934"]],
+        })
+
+        cursor = openim_local_cursor(bot, "wecom@openim")
+
+        self.assertEqual(cursor, 7934)
+        self.assertEqual(bot.handle_name, "OpenIMMsg.db")
+        self.assertIn("ChatCRMsg", bot.queries[0]["sql"])
+        self.assertIn("strTalker='wecom@openim'", bot.queries[0]["sql"])
+
+    def test_finds_new_outgoing_msgid_after_cursor(self):
+        bot = self.QueryBot({
+            "result": "OK",
+            "data": [
+                ["localId", "MsgSvrID", "type", "strContent", "IsSender"],
+                ["7935", "7913379307657962822", "1", "发给企业微信", "1"],
+            ],
+        })
+
+        msgid = find_openim_sent_reference(
+            bot,
+            "wecom@openim",
+            7934,
+            expected_type=1,
+            expected_content="发给企业微信",
+        )
+
+        self.assertEqual(msgid, "7913379307657962822")
+        self.assertIn("IsSender=1", bot.queries[0]["sql"])
+        self.assertIn("localId>7934", bot.queries[0]["sql"])
+
+    def test_wait_polls_until_row_is_visible(self):
+        bot = self.QueryBot(
+            {
+                "result": "OK",
+                "data": [
+                    ["localId", "MsgSvrID", "type", "strContent", "IsSender"],
+                ],
+            },
+            {
+                "result": "OK",
+                "data": [
+                    ["localId", "MsgSvrID", "type", "strContent", "IsSender"],
+                    ["7935", "123456789", "1", "hello", "1"],
+                ],
+            },
+        )
+        clock = iter((0.0, 0.0, 0.1, 0.1))
+
+        msgid = wait_for_openim_sent_reference(
+            bot,
+            "wecom@openim",
+            7934,
+            timeout=1,
+            sleep=lambda _seconds: None,
+            monotonic=lambda: next(clock),
+        )
+
+        self.assertEqual(msgid, "123456789")
+        self.assertEqual(len(bot.queries), 2)
 
 
 class OpenIMMediaDownloadTest(unittest.TestCase):
